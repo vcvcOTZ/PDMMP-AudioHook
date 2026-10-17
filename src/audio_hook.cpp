@@ -71,7 +71,7 @@ static int g_asioEn     = 0;    /* 1 = ASIO bridge enabled            */
 static int g_asioBlock  = 64;   /* ASIO block size (16..1024 step 16) */
 static int g_muteMode   = 1;    /* 1 = tap-and-zero (v11), 0 = SetMute */
 static int g_handoffMs  = 0;    /* 0 = auto (measured buffer + 2ms)   */
-static char g_asioMatch[96] = "Focusrite USB";  /* "" or "*" = any driver */
+static char g_asioMatch[96] = "*";               /* "" or "*" = any driver */
 
 static volatile LONG g_initCalls = 0;
 static volatile LONG g_rcCalls   = 0;

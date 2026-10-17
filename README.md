@@ -114,7 +114,7 @@ Edit `mods/Audio Hook/audio_hook.txt`:
 
 ```toml
 asio        = 1              # 1 = ASIO bridge; 0 = WASAPI optimization only
-asio_driver = Focusrite USB  # ASIO driver name substring; "*" = first driver
+asio_driver = *  # ASIO driver name substring; "*" = first driver
 mute_mode   = 1              # 1 = tap-and-zero (recommended); 0 = legacy SetMute
 block       = 64             # ASIO block size 16..1024 (64 = 4.1 ms)
 handoff_ms  = 0              # 0 = auto (measured buffer + 2 ms); >0 = override
@@ -123,7 +123,7 @@ handoff_ms  = 0              # 0 = auto (measured buffer + 2 ms); >0 = override
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `asio` | `1` | Enable the ASIO bridge. `0` = pure WASAPI shared-mode optimization (the v9 behaviour). |
-| `asio_driver` | `Focusrite USB` | Substring match against `HKLM\SOFTWARE\ASIO` driver names. `"*"` picks the first available driver. |
+| `asio_driver` | `*` | Substring match against `HKLM\SOFTWARE\ASIO` driver names. `"*"` picks the first available driver; set a specific name (e.g. `Focusrite USB`) if you have several. |
 | `mute_mode` | `1` | `1` = tap-and-zero seamless handoff; `0` = legacy `SetMute` (kept for A/B testing). |
 | `block` | `64` | ASIO buffer size. Lower = lower latency, higher = more headroom. |
 | `handoff_ms` | `0` | Handoff delay. `0` auto-computes from the measured game buffer. |

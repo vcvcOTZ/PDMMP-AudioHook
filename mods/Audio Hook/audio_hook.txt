@@ -7,7 +7,7 @@
 # 急救：同目录放空文件 audio_hook.off
 
 asio        = 1
-asio_driver = Focusrite USB
+asio_driver = *
 mute_mode   = 1
 block       = 64
 handoff_ms  = 0
