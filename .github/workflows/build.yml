@@ -1,0 +1,39 @@
+name: Build audio_hook.dll
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (MSVC x64)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+          call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cd src
+          if not exist hook_obj mkdir hook_obj
+          cl -nologo -utf-8 -LD -MT -O2 -W3 -Iasiosdk -Fe:audio_hook.dll -Fo:hook_obj\ audio_hook.cpp -link -MACHINE:X64 user32.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio_hook.dll
+          path: src/audio_hook.dll
+
+      - name: Attach to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src/audio_hook.dll
+          generate_release_notes: true
