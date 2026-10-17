@@ -130,6 +130,22 @@ handoff_ms  = 0              # 0 = auto (measured buffer + 2 ms); >0 = override
 
 ---
 
+## Companion tool: `asio_list`
+
+Lists every ASIO driver on your machine and plays a test tone through any of
+them, so you can hear which physical output a driver actually drives — handy
+when you need to set `asio_driver` correctly.
+
+```
+asio_list                      # interactive menu (Up/Down + Enter to test)
+asio_list --list               # plain text list
+asio_list --test "Focusrite USB"   # play the 3 s tone directly
+```
+
+Prebuilt binary: `tools/asio_list.exe` (or build from `src/asio_list.cpp`).
+
+---
+
 ## How it works
 
 ```
