@@ -1,0 +1,13 @@
+# audio_hook config
+# asio        : 1 = 游戏音频走 ASIO 直通（低延迟）；0 = 仅共享模式优化
+# asio_driver : ASIO 驱动名子串；"*" = 第一个可用驱动
+# mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
+# block       : ASIO 块大小 16..1024（64 = 4.1ms）
+# handoff_ms  : 0 = 自动；>0 = 手动覆盖
+# 急救：同目录放空文件 audio_hook.off
+
+asio        = 1
+asio_driver = Focusrite USB
+mute_mode   = 1
+block       = 64
+handoff_ms  = 0

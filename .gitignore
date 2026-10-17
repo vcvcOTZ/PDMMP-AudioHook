@@ -1,0 +1,14 @@
+# --- runtime logs / emergency kill switch ---
+audio_hook.log
+audio_hook_detach.log
+audio_hook.off
+
+# --- build artifacts ---
+*.obj
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.exe
+hook_obj/
+probe_obj/

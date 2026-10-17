@@ -1,0 +1,8 @@
+enabled = true
+name = "Audio Hook"
+description = "Game audio ASIO bridge + shared-mode buffer optimization"
+version = "0.2.1"
+date = "17.10.2026"
+author = "vcvcOTZ"
+
+dll = ["audio_hook.dll"]
