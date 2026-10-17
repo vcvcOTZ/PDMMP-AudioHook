@@ -46,27 +46,29 @@ static ASIOChannelInfo g_ci[2];
 static long            g_block = 0;
 static double          g_rate = 44100.0;
 static double          g_phase = 0.0;
+static double          g_env = 0.0;      /* fade-in envelope 0..1 */
+static double          g_envStep = 0.0;
 static volatile LONG   g_playing = 0;
 
 static void WriteTone(void* p, long type, long block)
 {
     const double PI2 = 6.283185307179586;
     double w = PI2 * 440.0 / g_rate;
-    double amp = 0.25;
+    double a = 0.12 * g_env;   /* softer level, with a ~120 ms fade-in */
     double ph0 = g_phase;
     switch (type) {
     case ASIOSTInt16LSB: {
         short* o = (short*)p;
-        for (long i = 0; i < block; i++) o[i] = (short)(sin(ph0 + w * i) * amp * 32767.0);
+        for (long i = 0; i < block; i++) o[i] = (short)(sin(ph0 + w * i) * a * 32767.0);
     } break;
     case ASIOSTInt32LSB: case ASIOSTInt32LSB16: case ASIOSTInt32LSB18:
     case ASIOSTInt32LSB20: case ASIOSTInt32LSB24: {
         int32_t* o = (int32_t*)p;
-        for (long i = 0; i < block; i++) o[i] = (int32_t)(sin(ph0 + w * i) * amp * 2147483647.0);
+        for (long i = 0; i < block; i++) o[i] = (int32_t)(sin(ph0 + w * i) * a * 2147483647.0);
     } break;
     case ASIOSTFloat32LSB: {
         float* o = (float*)p;
-        for (long i = 0; i < block; i++) o[i] = (float)(sin(ph0 + w * i) * amp);
+        for (long i = 0; i < block; i++) o[i] = (float)(sin(ph0 + w * i) * a);
     } break;
     default:
         memset(p, 0, (size_t)block * 4);
@@ -74,6 +76,7 @@ static void WriteTone(void* p, long type, long block)
     }
     g_phase = ph0 + w * block;
     if (g_phase > PI2) g_phase = fmod(g_phase, PI2);
+    if (g_env < 1.0) { g_env += g_envStep; if (g_env > 1.0) g_env = 1.0; }
 }
 
 static void cbBufferSwitch(long index, ASIOBool direct)
@@ -81,6 +84,7 @@ static void cbBufferSwitch(long index, ASIOBool direct)
     (void)direct;
     for (int c = 0; c < 2; c++) {
         void* b = g_bufs[c].buffers[index];
+        if (!b) continue;   /* single-buffer or malformed driver */
         if (g_playing) WriteTone(b, g_ci[c].type, g_block);
         else memset(b, 0, (size_t)g_block * 4);
     }
@@ -172,6 +176,11 @@ static int TestTone(const char* clsid, int seconds)
 
         g_asio = asio;
         g_phase = 0.0;
+        g_env = 0.0;
+        {
+            double blocks = 0.12 * g_rate / g_block;   /* ~120 ms fade-in */
+            g_envStep = blocks > 1.0 ? 1.0 / blocks : 1.0;
+        }
         InterlockedExchange(&g_playing, 1);
         if (asio->start() != ASE_OK) { InterlockedExchange(&g_playing, 0); goto done; }
 
