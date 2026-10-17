@@ -1,7 +1,7 @@
 enabled = true
 name = "Audio Hook"
-description = "Game audio ASIO bridge + shared-mode buffer optimization"
-version = "0.2.1"
+description = "Low-latency audio: replaces CRI's audio client (no engine buffer), ASIO / WASAPI exclusive / WASAPI shared output"
+version = "0.3.0"
 date = "17.10.2026"
 author = "vcvcOTZ"
 

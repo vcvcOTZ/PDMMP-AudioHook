@@ -1,13 +1,24 @@
-# audio_hook config
-# asio        : 1 = 游戏音频走 ASIO 直通（低延迟）；0 = 仅共享模式优化
-# asio_driver : ASIO 驱动名子串；"*" = 第一个可用驱动
-# mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
-# block       : ASIO 块大小 16..1024（64 = 4.1ms）
+# audio_hook config  (v13)
+#
+# fake_client : 1 = 接管 CRI 的 stream1 客户端（去掉游戏自带的 22ms 缓冲）
+#               ★ 低延迟的核心开关，必须为 1 才能用 output 后端
+# output      : asio   = ASIO 直通（推荐，本机最快，软件链路 ≈10ms）
+#               shared = WASAPI 共享（没有 ASIO 驱动时用；受引擎 22ms 缓冲限制）
+#               excl   = WASAPI 独占（启动自检 600ms，实测速率 <95% 会自动回退到 shared）
+#                        ★ Focusrite 本机只有 88.5%，会自动降级；换好驱动机器才用得上
+# asio        : output=asio 时是否启用 ASIO 后端（1 = 启用）
+# asio_driver : 填 asio_list 里显示的完整驱动名最精确；也可填名称子串；"*" = 第一个可用驱动
+# block       : ASIO 块大小 16..1024（64 = 1.45ms）
 # handoff_ms  : 0 = 自动；>0 = 手动覆盖
+# mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
+# exclusive2  : 旧路线B实验（独占 + 伪 EC），已废弃，保持 0
 # 急救：同目录放空文件 audio_hook.off
 
+fake_client = 1
+output      = asio
 asio        = 1
-asio_driver = *
-mute_mode   = 1
+asio_driver = Focusrite USB ASIO
 block       = 64
 handoff_ms  = 0
+mute_mode   = 1
+exclusive2  = 0

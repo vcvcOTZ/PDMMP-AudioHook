@@ -24,9 +24,19 @@ if not defined VSCMD (
 call "%VSCMD%" -arch=x64 -host_arch=x64 >nul
 if not exist "hook_obj" mkdir "hook_obj"
 cl -nologo -utf-8 -LD -MT -O2 -W3 -Iasiosdk -Fe:audio_hook.dll -Fo:hook_obj\ audio_hook.cpp -link -MACHINE:X64 user32.lib
-if errorlevel 1 ( echo [FAILED] & pause & exit /b 1 )
+if errorlevel 1 ( echo [FAILED] audio_hook.dll & pause & exit /b 1 )
+
+cl -nologo -utf-8 -MT -O2 -W3 -Iasiosdk -Fe:asio_list.exe asio_list.cpp -link ole32.lib advapi32.lib user32.lib
+if errorlevel 1 ( echo [FAILED] asio_list.exe & pause & exit /b 1 )
+
+cl -nologo -utf-8 -MT -O2 -W3 -Fe:excl_rate_probe.exe excl_rate_probe.cpp -link ole32.lib uuid.lib
+if errorlevel 1 ( echo [FAILED] excl_rate_probe.exe & pause & exit /b 1 )
+
+cl -nologo -utf-8 -MT -O2 -W3 -Fe:session_tool.exe session_tool.cpp -link ole32.lib uuid.lib psapi.lib
+if errorlevel 1 ( echo [FAILED] session_tool.exe & pause & exit /b 1 )
+
 echo.
-echo [DONE] audio_hook.dll built.
-echo Copy it to ..\mods\Audio Hook\ and restart the game.
+echo [DONE] audio_hook.dll + tools built.
+echo Copy audio_hook.dll to ..\mods\Audio Hook\ and restart the game.
 pause
 endlocal

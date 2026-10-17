@@ -1,4 +1,4 @@
-/*
+﻿/*
  * audio_hook.cpp -- PDMMP audio hook (v11.3 build, 2026-10-17, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Base behaviour (always active):
@@ -72,6 +72,14 @@ static int g_asioBlock  = 64;   /* ASIO block size (16..1024 step 16) */
 static int g_muteMode   = 1;    /* 1 = tap-and-zero (v11), 0 = SetMute */
 static int g_handoffMs  = 0;    /* 0 = auto (measured buffer + 2ms)   */
 static char g_asioMatch[96] = "*";               /* "" or "*" = any driver */
+static int  g_exclusive2 = 0;    /* 1 = experimental EXCLUSIVE + pseudo-EC */
+static int  g_fakeClient = 0;    /* 1 = v13: own CRI's stream1 client (no engine buffer) */
+static int  g_outMode = 0;       /* 0 = ASIO, 1 = WASAPI exclusive, 2 = WASAPI shared */
+static volatile LONG g_woState = 0;   /* 0=off 2=starting 3=running 4=failed */
+static volatile LONG g_woUnder = 0;
+static volatile LONG g_woCbs   = 0;
+static volatile LONG64 g_woOut = 0;   /* frames handed to the output stream */
+static volatile LONG g_fakeGbFail = 0;   /* CRI GetBuffer() rejected (queue full) */
 
 static volatile LONG g_initCalls = 0;
 static volatile LONG g_rcCalls   = 0;
@@ -166,6 +174,12 @@ static volatile LONG   g_zeroTap   = 0;   /* v11: zero the game buffer after cop
 static volatile LONG   g_kicked    = 0;   /* stream1 died while bridging */
 static volatile LONG   g_asioStartReq = 0;
 static volatile LONG   g_s1BufFrames  = 0; /* measured stream1 buffer (frames) */
+
+/* ---- experimental exclusive2 (pseudo-EC) ---- */
+static HANDLE          g_s1Event = NULL;     /* stream1 SetEventHandle value */
+static volatile LONG   g_s1PeriodFrames = 0; /* exclusive periodicity (frames) */
+static volatile LONG   g_pseudoEC = 0;       /* driver thread running        */
+static volatile LONG   g_ecSetEvents = 0;    /* SetEvent count               */
 
 #define S1_MAX 8
 static volatile LONG g_s1ClientN = 0;
@@ -352,6 +366,9 @@ static void WriteSamples(void* p, long type, int ch, const short* src, unsigned 
     }
 }
 
+static void FakePoke(void);   /* v13, defined in the fake-client section */
+static BOOL WoStart(int exclusive);   /* v13, defined in the WASAPI-output section */
+
 static void AsioFill(long index)
 {
     InterlockedIncrement(&g_asoCbs);
@@ -365,6 +382,7 @@ static void AsioFill(long index)
     for (int c = 0; c < 2; c++)
         WriteSamples(g_abufs[c].buffers[index], g_aci[c].type, c, g_tmp, got, (unsigned)blk);
     if (g_apostOut && g_asio) g_asio->outputReady();
+    FakePoke();   /* v13: top up CRI's fake client from the real output clock */
 }
 
 static ASIOTime* cbBufferSwitchTimeInfo(ASIOTime* params, long index, ASIOBool direct)
@@ -600,8 +618,13 @@ static DWORD WINAPI AsioStartThread(LPVOID)
 
     if (!AsioPrepare())
     {
-        Log("[asio] !! prepare failed - staying on the WASAPI path (v9 behaviour)");
         InterlockedExchange(&g_asioState, 4);
+        if (g_fakeClient)
+        {
+            Log("[asio] !! prepare failed -> falling back to WASAPI shared output");
+            if (!WoStart(0)) Log("[out] !! shared fallback also failed - no audio");
+        }
+        else Log("[asio] !! prepare failed - staying on the WASAPI path (v9 behaviour)");
         return 0;
     }
 
@@ -760,8 +783,16 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_ReleaseBuffer(void* self, UINT32 frames
     return hr;
 }
 
+/* v13 forward decls (definitions live in the fake-client section below) */
+static int    FakeIsSelf(IAudioClient* self);
+static HRESULT FakeSetEventHandle(IAudioClient* self, HANDLE hEvent);
+static HRESULT FakeGetService(REFIID riid, void** ppv);
+static void   FakePoke(void);
+
 static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* self, REFIID riid, void** ppv)
 {
+    if (FakeIsSelf(self)) return FakeGetService(riid, ppv);
+
     HRESULT hr = oGS ? oGS(self, riid, ppv) : E_FAIL;
     BOOL isRC = (riid.Data1 == 0xF294ACFC && riid.Data2 == 0x3146 && riid.Data3 == 0x4483);
 
@@ -795,13 +826,591 @@ static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* self, REFIID riid
     return hr;
 }
 
+/* ------------- exclusive2: SetEventHandle hook + pseudo-EC driver ------------- */
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SEH)(IAudioClient* self, HANDLE hEvent);
+static PFN_SEH oSEH = NULL;
+
+static HRESULT STDMETHODCALLTYPE Hook_SetEventHandle(IAudioClient* self, HANDLE hEvent)
+{
+    if (FakeIsSelf(self)) return FakeSetEventHandle(self, hEvent);
+
+    HRESULT hr = oSEH ? oSEH(self, hEvent) : E_FAIL;
+    if (SUCCEEDED(hr) && g_exclusive2 && IsS1Client(self)) {
+        g_s1Event = hEvent;
+        Log("[ec] stream1 event handle = %p", hEvent);
+    }
+    return hr;
+}
+
+/* Poll the exclusive buffer; when a full period of room is free, poke CRI's
+   event so it fills. This replaces engine-driven EVENTCALLBACK timing with
+   device-consumption-driven timing (the clock mismatch disappears). */
+static DWORD WINAPI PseudoECThread(LPVOID)
+{
+    Log("[ec] pseudo-EC driver started");
+    while (g_pseudoEC) {
+        IAudioClient* c = (IAudioClient*)g_s1Clients[0];
+        if (!c || !g_s1Event || g_s1BufFrames <= 0) { Sleep(5); continue; }
+        UINT32 padding = 0;
+        if (FAILED(c->GetCurrentPadding(&padding))) { Sleep(5); continue; }
+        UINT32 avail = (UINT32)g_s1BufFrames - padding;
+        if (avail >= (UINT32)g_s1PeriodFrames) {
+            if (SetEvent(g_s1Event)) InterlockedIncrement(&g_ecSetEvents);
+            Sleep(0);
+        } else {
+            Sleep(0);
+        }
+    }
+    return 0;
+}
+
+/* ===================================================================== */
+/*  v13: fake IAudioClient for stream1                                   */
+/*                                                                       */
+/*  Instead of letting CRI create a real WASAPI stream (whose engine     */
+/*  buffer is 22 ms and which keeps the device busy), we hand CRI a      */
+/*  client object we own. CRI mixes into our memory, so                   */
+/*    - the 22 ms engine buffer disappears from the path, and             */
+/*    - the audio device stays completely free for an exclusive stream.   */
+/*  Only vtable slots are touched (data layer) -> Denuvo-safe.            */
+/* ===================================================================== */
+
+#define FAKE_FRAMES 441          /* 10 ms @44.1k - exactly what CRI requests */
+#define FAKE_CHUNK  441          /* CRI's fill chunk */
+#define FAKE_LOW    220          /* refill CRI when the queue drops below ~5 ms */
+
+struct FakeState
+{
+    IAudioClient* self;
+    WAVEFORMATEX  fmt;
+    short*        stage;         /* FAKE_FRAMES*2 shorts - GetBuffer() target */
+    short*        zero;          /* silent-release source */
+    HANDLE        ev;
+    volatile LONG on;
+    volatile LONG running;
+};
+static FakeState g_fake;
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GBS)(IAudioClient*, UINT32*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GLAT)(IAudioClient*, REFERENCE_TIME*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GPAD)(IAudioClient*, UINT32*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_ISF)(IAudioClient*, AUDCLNT_SHAREMODE, const WAVEFORMATEX*, WAVEFORMATEX**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GMF)(IAudioClient*, WAVEFORMATEX**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GDP)(IAudioClient*, REFERENCE_TIME*, REFERENCE_TIME*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_NOP)(IAudioClient*);
+
+static PFN_GBS   oGBS  = NULL;
+static PFN_GLAT  oGLat = NULL;
+static PFN_GPAD  oGPad = NULL;
+static PFN_ISF   oIsF  = NULL;
+static PFN_GMF   oGMF  = NULL;
+static PFN_GDP   oGDP  = NULL;
+static PFN_NOP   oStart = NULL, oStop = NULL, oReset = NULL;
+static volatile LONG g_fakePatched = 0;
+
+static int FakeIsSelf(IAudioClient* self) { return g_fake.on && self == g_fake.self; }
+
+/* ---- our IAudioRenderClient ---- */
+class FakeRC : public IAudioRenderClient
+{
+public:
+    FakeRC() : m_ref(1) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) || IsEqualIID(riid, __uuidof(IAudioRenderClient)))
+        { *ppv = this; AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(UINT32 n, BYTE** pp) override
+    {
+        if (!pp) return E_POINTER;
+        if (n > FAKE_FRAMES) { InterlockedIncrement(&g_fakeGbFail); return (HRESULT)0x88890006; }
+        if (RingAvail() + n > FAKE_FRAMES) { InterlockedIncrement(&g_fakeGbFail); return (HRESULT)0x88890006; }
+        *pp = (BYTE*)g_fake.stage;
+        LONG k = InterlockedIncrement(&m_calls);
+        if (k <= 10) Log("[fake-rc] GetBuffer(%u) avail=%u", n, RingAvail());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 n, DWORD flags) override
+    {
+        LONG k2 = m_calls;
+        if (k2 <= 10) Log("[fake-rc] ReleaseBuffer(%u, flags=0x%X)", n, flags);
+        if (n > FAKE_FRAMES) return E_INVALIDARG;
+        if (n)
+        {
+            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) RingWrite(g_fake.zero, n);
+            else                                    RingWrite(g_fake.stage, n);
+            InterlockedExchangeAdd64(&g_tapFrames, (LONG64)n);
+        }
+        return S_OK;
+    }
+private:
+    LONG m_ref;
+    LONG m_calls = 0;
+};
+
+/* ---- our IAudioClock ---- */
+static volatile LONG64 g_fakePlayed = 0;
+static const GUID kIID_IAudioClock =
+{ 0xCD63314F, 0x3FD1, 0x4A1F, { 0xBA, 0x1B, 0x28, 0xED, 0x6E, 0xF1, 0xF6, 0x57 } };
+
+class FakeClock : public IAudioClock
+{
+public:
+    FakeClock() : m_ref(1) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) || IsEqualIID(riid, kIID_IAudioClock))
+        { *ppv = this; AddRef(); return S_OK; }
+        *ppv = NULL; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE GetFrequency(UINT64* f) override
+    { if (!f) return E_POINTER; *f = 44100; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPosition(UINT64* pos, UINT64* qpc) override
+    {
+        if (pos) *pos = (UINT64)g_fakePlayed;
+        if (qpc) *qpc = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCharacteristics(DWORD* c) override
+    {
+        if (!c) return E_POINTER;
+        *c = 0x1;   /* AUDCLNT_AUDIOCLOCK_CHARACTERISTIC_FIXED_FREQUENCY */
+        return S_OK;
+    }
+private:
+    LONG m_ref;
+};
+
+static FakeRC*    g_fakeRc = NULL;
+static FakeClock* g_fakeClk = NULL;
+
+static HRESULT FakeSetEventHandle(IAudioClient* self, HANDLE h)
+{
+    (void)self;
+    g_fake.ev = h;
+    Log("[fake] SetEventHandle(%p)", h);
+    return S_OK;
+}
+
+static HRESULT FakeGetService(REFIID riid, void** ppv)
+{
+    if (!ppv) return E_POINTER;
+    *ppv = NULL;
+    if (riid.Data1 == 0xF294ACFC && riid.Data2 == 0x3146 && riid.Data3 == 0x4483)
+    {
+        *ppv = (void*)g_fakeRc;
+        g_fakeRc->AddRef();
+        Log("[fake] GetService -> IAudioRenderClient");
+        return S_OK;
+    }
+    if (IsEqualIID(riid, kIID_IAudioClock))
+    {
+        *ppv = (void*)g_fakeClk;
+        g_fakeClk->AddRef();
+        Log("[fake] GetService -> IAudioClock");
+        return S_OK;
+    }
+    if (IsEqualIID(riid, __uuidof(IUnknown)))
+    {
+        *ppv = (void*)g_fakeRc;
+        g_fakeRc->AddRef();
+        return S_OK;
+    }
+    Log("[fake] GetService unsupported riid=%08X-%04X-%04X", riid.Data1, riid.Data2, riid.Data3);
+    return E_NOINTERFACE;
+}
+
+/* ---- driver: pace CRI from the real output clock ---- */
+static void FakePoke(void)
+{
+    if (!g_fake.on || !g_fake.running || !g_fake.ev) return;
+    if (RingAvail() <= FAKE_LOW) SetEvent(g_fake.ev);
+}
+
+static DWORD WINAPI FakeDriverThread(LPVOID)
+{
+    Log("[fake] driver up (frames=%u low=%u)", (unsigned)FAKE_FRAMES, (unsigned)FAKE_LOW);
+    while (g_fake.running)
+    {
+        if (g_asioState == 3 || g_woState == 3)
+        {
+            /* ASIO gives us a 1.45 ms callback to pace CRI from; the WASAPI stream
+               can have a 20+ ms period, so there we must top the queue up here as
+               well (the ring has ~10 ms of slack, so 1 ms polling is safe). */
+            if (g_woState == 3) { FakePoke(); Sleep(1); }
+            else Sleep(20);
+            static ULONGLONG last = 0;
+            ULONGLONG now = GetTickCount64();
+            if (now - last >= 5000)
+            {
+                last = now;
+                Log("[out] cbs=%ld und=%ld avail=%u taps=%lld gbfail=%ld asio=%ld wo=%ld",
+                    g_woCbs, g_woUnder, RingAvail(), (long long)g_tapFrames, g_fakeGbFail,
+                    g_asioState, g_woState);
+            }
+            continue;
+        }
+        /* no consumer yet (ASIO still starting, or ASIO off): drain at real time
+           so CRI keeps a sane clock and the game never stalls */
+        Sleep(5);
+        unsigned a = RingAvail();
+        unsigned n = a >= FAKE_CHUNK ? FAKE_CHUNK / 2 : a;
+        if (n) { static short tmp[512]; RingRead(tmp, n); }
+        FakePoke();
+    }
+    Log("[fake] driver stopped");
+    return 0;
+}
+
+/* ---- fake vtable implementations (dispatch: ours vs real) ---- */
+static HRESULT STDMETHODCALLTYPE Fake_GetBufferSize(IAudioClient* s, UINT32* p)
+{
+    if (FakeIsSelf(s)) { if (p) *p = FAKE_FRAMES; return S_OK; }
+    return oGBS ? oGBS(s, p) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_GetStreamLatency(IAudioClient* s, REFERENCE_TIME* p)
+{
+    if (FakeIsSelf(s)) { if (p) *p = 0; return S_OK; }
+    return oGLat ? oGLat(s, p) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_GetCurrentPadding(IAudioClient* s, UINT32* p)
+{
+    if (FakeIsSelf(s)) { if (p) *p = RingAvail(); return S_OK; }
+    return oGPad ? oGPad(s, p) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_IsFormatSupported(IAudioClient* s, AUDCLNT_SHAREMODE m,
+                                                        const WAVEFORMATEX* f, WAVEFORMATEX** closest)
+{
+    if (FakeIsSelf(s)) { if (closest) *closest = NULL; return S_OK; }
+    return oIsF ? oIsF(s, m, f, closest) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_GetMixFormat(IAudioClient* s, WAVEFORMATEX** pp)
+{
+    if (FakeIsSelf(s))
+    {
+        if (!pp) return E_POINTER;
+        WAVEFORMATEX* w = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+        if (!w) return E_OUTOFMEMORY;
+        *w = g_fake.fmt;
+        w->cbSize = 0;
+        *pp = w;
+        return S_OK;
+    }
+    return oGMF ? oGMF(s, pp) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_GetDevicePeriod(IAudioClient* s, REFERENCE_TIME* def, REFERENCE_TIME* mn)
+{
+    if (FakeIsSelf(s)) { if (def) *def = 100000; if (mn) *mn = 30000; return S_OK; }
+    return oGDP ? oGDP(s, def, mn) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_Start(IAudioClient* s)
+{
+    if (FakeIsSelf(s))
+    {
+        if (InterlockedExchange(&g_fake.running, 1) == 0)
+        {
+            HANDLE t = CreateThread(NULL, 0, FakeDriverThread, NULL, 0, NULL);
+            if (t) CloseHandle(t); else InterlockedExchange(&g_fake.running, 0);
+            Log("[fake] Start() -> driver launched");
+        }
+        return S_OK;
+    }
+    return oStart ? oStart(s) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_Stop(IAudioClient* s)
+{
+    if (FakeIsSelf(s)) { InterlockedExchange(&g_fake.running, 0); Log("[fake] Stop()"); return S_OK; }
+    return oStop ? oStop(s) : E_FAIL;
+}
+static HRESULT STDMETHODCALLTYPE Fake_Reset(IAudioClient* s)
+{
+    if (FakeIsSelf(s)) return S_OK;
+    return oReset ? oReset(s) : E_FAIL;
+}
+
+/* ---- install: replace stream1's client ---- */
+static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
+{
+    if (!g_fake.stage)
+    {
+        g_fake.stage = (short*)calloc((size_t)FAKE_FRAMES * 2, sizeof(short));
+        g_fake.zero  = (short*)calloc((size_t)FAKE_FRAMES * 2, sizeof(short));
+    }
+    if (!g_fake.stage || !g_fake.zero) return E_OUTOFMEMORY;
+
+    if (!g_fakeRc)  g_fakeRc  = new FakeRC();
+    if (!g_fakeClk) g_fakeClk = new FakeClock();
+
+    g_fake.self = self;
+    memcpy(&g_fake.fmt, fmt, sizeof(WAVEFORMATEX));
+    g_fake.fmt.cbSize = 0;
+    g_fake.ev = NULL;
+    InterlockedExchange(&g_fake.running, 0);
+    InterlockedExchange(&g_fake.on, 1);
+
+    if (!g_fakePatched)
+    {
+        void** vt = *(void***)self;
+        BOOL ok =
+            PatchSlot(vt,  4, (void*)&Fake_GetBufferSize,    (void**)&oGBS)  &&
+            PatchSlot(vt,  5, (void*)&Fake_GetStreamLatency, (void**)&oGLat) &&
+            PatchSlot(vt,  6, (void*)&Fake_GetCurrentPadding,(void**)&oGPad) &&
+            PatchSlot(vt,  7, (void*)&Fake_IsFormatSupported,(void**)&oIsF)  &&
+            PatchSlot(vt,  8, (void*)&Fake_GetMixFormat,     (void**)&oGMF)  &&
+            PatchSlot(vt,  9, (void*)&Fake_GetDevicePeriod,  (void**)&oGDP)  &&
+            PatchSlot(vt, 10, (void*)&Fake_Start,            (void**)&oStart)&&
+            PatchSlot(vt, 11, (void*)&Fake_Stop,             (void**)&oStop) &&
+            PatchSlot(vt, 12, (void*)&Fake_Reset,            (void**)&oReset);
+        InterlockedExchange(&g_fakePatched, ok ? 1 : 0);
+        Log("[fake] vtable slots 4..12 patched: %s", ok ? "OK" : "FAIL");
+        if (!ok) return E_FAIL;
+    }
+
+    Log("[fake] stream1 client replaced: %u Hz / %u bit / %u ch, %u frames",
+        (unsigned)g_fake.fmt.nSamplesPerSec, (unsigned)g_fake.fmt.wBitsPerSample,
+        (unsigned)g_fake.fmt.nChannels, (unsigned)FAKE_FRAMES);
+    return S_OK;
+}
+
+/* ===================================================================== */
+/*  v13: WASAPI output backends  (exclusive / shared)                    */
+/*                                                                       */
+/*  With stream1 faked, the audio device is free. We can therefore open   */
+/*  our own stream on it - exclusive (5 ms period) or shared (engine      */
+/*  period) - and feed it from the same ring the ASIO path uses.          */
+/* ===================================================================== */
+
+static IAudioClient*       g_woClient = NULL;
+static IAudioRenderClient* g_woRender = NULL;
+static HANDLE              g_woEvent  = NULL;
+static UINT32              g_woFrames = 0;
+static int                 g_woFloat  = 0;
+static int                 g_woCh     = 2;   /* output channel count */
+static volatile LONG       g_woRun    = 0;
+
+static void WoFill16(BYTE* p, UINT32 n)
+{
+    static short tmp[2048 * 2];
+    short* o = (short*)p;
+    UINT32 done = 0, shortage = 0;
+    while (done < n)
+    {
+        UINT32 c = n - done; if (c > 2048) c = 2048;
+        unsigned got = RingRead(tmp, c);
+        for (UINT32 i = 0; i < c; i++)
+        {
+            short* d = o + (size_t)(done + i) * g_woCh;
+            short l = (i < got) ? tmp[i * 2] : 0;
+            short r = (i < got) ? tmp[i * 2 + 1] : 0;
+            for (int ch = 0; ch < g_woCh; ch++) d[ch] = (ch == 0) ? l : (ch == 1 ? r : 0);
+        }
+        if (got < c) shortage += c - got;
+        done += c;
+    }
+    if (shortage) InterlockedIncrement(&g_woUnder);
+}
+
+static void WoFillFloat(BYTE* p, UINT32 n)
+{
+    static short tmp[2048 * 2];
+    float* o = (float*)p;
+    UINT32 done = 0, shortage = 0;
+    const float k = 1.0f / 32768.0f;
+    while (done < n)
+    {
+        UINT32 c = n - done; if (c > 2048) c = 2048;
+        unsigned got = RingRead(tmp, c);
+        for (UINT32 i = 0; i < c; i++)
+        {
+            float* d = o + (size_t)(done + i) * g_woCh;
+            float l = (i < got) ? (float)tmp[i * 2] * k : 0.0f;
+            float r = (i < got) ? (float)tmp[i * 2 + 1] * k : 0.0f;
+            for (int ch = 0; ch < g_woCh; ch++) d[ch] = (ch == 0) ? l : (ch == 1 ? r : 0.0f);
+        }
+        if (got < c) shortage += c - got;
+        done += c;
+    }
+    if (shortage) InterlockedIncrement(&g_woUnder);
+}
+
+static DWORD WINAPI WoThread(LPVOID)
+{
+    Log("[wo] thread up (frames=%u float=%d)", (unsigned)g_woFrames, g_woFloat);
+    if (FAILED(g_woClient->Start()))
+    {
+        Log("[wo] !! Start failed");
+        InterlockedExchange(&g_woState, 4);
+        return 0;
+    }
+    InterlockedExchange(&g_woState, 3);
+    Log("[wo] output running");
+    while (g_woRun)
+    {
+        DWORD w = WaitForSingleObject(g_woEvent, 200);
+        if (!g_woRun) break;
+        if (w != WAIT_OBJECT_0) continue;
+        UINT32 pad = 0;
+        if (FAILED(g_woClient->GetCurrentPadding(&pad))) { Sleep(2); continue; }
+        UINT32 free_ = g_woFrames > pad ? g_woFrames - pad : 0;
+        /* only write what the ring actually holds: the engine buffer can be much
+           larger than CRI's own queue (e.g. 1056 vs 441), and blindly filling the
+           whole free space would zero-pad (audible underrun) every period. */
+        UINT32 avail = RingAvail();
+        UINT32 n = free_ < avail ? free_ : avail;
+        if (n)
+        {
+            BYTE* p = NULL;
+            if (SUCCEEDED(g_woRender->GetBuffer(n, &p)) && p)
+            {
+                if (g_woFloat) WoFillFloat(p, n); else WoFill16(p, n);
+                g_woRender->ReleaseBuffer(n, 0);
+                InterlockedIncrement(&g_woCbs);
+                InterlockedExchangeAdd64(&g_woOut, (LONG64)n);
+            }
+        }
+        FakePoke();
+    }
+    g_woClient->Stop();
+    Log("[wo] thread exit");
+    return 0;
+}
+
+/* Synchronous init: must claim the device before CRI creates stream2. */
+static BOOL WoInit(int exclusive)
+{
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* ignore RPC_E_CHANGED_MODE */
+
+    IMMDeviceEnumerator* en = NULL;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)&en);
+    if (FAILED(hr) || !en) { Log("[wo] !! enumerator hr=0x%08X", (unsigned)hr); return FALSE; }
+    IMMDevice* dev = NULL;
+    hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+    en->Release();
+    if (FAILED(hr) || !dev) { Log("[wo] !! endpoint hr=0x%08X", (unsigned)hr); return FALSE; }
+    hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_woClient);
+    dev->Release();
+    if (FAILED(hr) || !g_woClient) { Log("[wo] !! activate hr=0x%08X", (unsigned)hr); return FALSE; }
+
+    WAVEFORMATEX* wf = NULL;   /* must keep the full WAVEFORMATEXTENSIBLE for shared mode */
+    g_woFloat = 0;
+
+    if (exclusive)
+    {
+        wf = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+        if (!wf) return FALSE;
+        memset(wf, 0, sizeof(WAVEFORMATEX));
+        wf->wFormatTag      = WAVE_FORMAT_PCM;
+        wf->nChannels       = 2;
+        wf->nSamplesPerSec  = 44100;
+        wf->wBitsPerSample  = 16;
+        wf->nBlockAlign     = 4;
+        wf->nAvgBytesPerSec = 44100 * 4;
+        wf->cbSize          = 0;
+        WAVEFORMATEX* closest = NULL;
+        HRESULT chk = g_woClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf, &closest);
+        if (chk != S_OK) { Log("[wo] !! exclusive 16-bit rejected hr=0x%08X", (unsigned)chk); return FALSE; }
+    }
+    else
+    {
+        if (FAILED(g_woClient->GetMixFormat(&wf)) || !wf) { Log("[wo] !! GetMixFormat failed"); return FALSE; }
+        g_woFloat = (wf->wBitsPerSample == 32) ? 1 : 0;
+    }
+
+    REFERENCE_TIME dur = exclusive ? 50000 : 0;
+    REFERENCE_TIME per = exclusive ? 50000 : 0;
+    hr = g_woClient->Initialize(exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE : AUDCLNT_SHAREMODE_SHARED,
+                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, per, wf, NULL);
+    if (FAILED(hr))
+    {
+        Log("[wo] !! Initialize hr=0x%08X %s (tag=0x%X %u Hz %u bit %u ch cbSize=%u)",
+            (unsigned)hr, HrBrief(hr), wf->wFormatTag, wf->nSamplesPerSec,
+            wf->wBitsPerSample, wf->nChannels, wf->cbSize);
+        CoTaskMemFree(wf);
+        return FALSE;
+    }
+    if (FAILED(g_woClient->GetBufferSize(&g_woFrames))) { Log("[wo] !! GetBufferSize failed"); return FALSE; }
+
+    g_woEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_woEvent || FAILED(g_woClient->SetEventHandle(g_woEvent)))
+    { Log("[wo] !! event setup failed"); return FALSE; }
+    if (FAILED(g_woClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_woRender)) || !g_woRender)
+    { Log("[wo] !! GetService render failed"); return FALSE; }
+
+    g_woCh = wf->nChannels;
+    Log("[wo] ready: %s %u Hz / %u bit / %u ch tag=0x%X, buffer=%u fr (%.2f ms)",
+        exclusive ? "EXCLUSIVE" : "SHARED", wf->nSamplesPerSec, wf->wBitsPerSample, wf->nChannels,
+        wf->wFormatTag, g_woFrames, g_woFrames * 1000.0 / 44100.0);
+    CoTaskMemFree(wf);
+    return TRUE;
+}
+
+/* Init + start. exclusive==1 -> exclusive, else shared.
+   Exclusive gets a 600 ms self-test: some drivers (Focusrite USB here) hand out
+   a 5 ms buffer but only consume ~88% of real time, which starves the queue and
+   makes the game's music stutter/repeat. If the measured rate is short we stop
+   and let the caller fall back, so a bad driver can never break audio. */
+static BOOL WoStart(int exclusive)
+{
+    if (InterlockedCompareExchange(&g_woState, 2, 0) != 0) return g_woState == 3;
+    if (!WoInit(exclusive)) { InterlockedExchange(&g_woState, 0); return FALSE; }
+
+    InterlockedExchange64(&g_woOut, 0);
+    InterlockedExchange(&g_woRun, 1);
+    HANDLE t = CreateThread(NULL, 0, WoThread, NULL, 0, NULL);
+    if (!t) { InterlockedExchange(&g_woState, 4); return FALSE; }
+    CloseHandle(t);
+
+    if (exclusive)
+    {
+        Sleep(600);
+        LONG64 out = g_woOut;
+        double rate = (double)out / 0.6;
+        if (rate < 44100.0 * 0.95)
+        {
+            Log("[wo] !! exclusive self-test FAILED: %.0f fr/s (%.1f%% of 44100) - rolling back",
+                rate, 100.0 * rate / 44100.0);
+            InterlockedExchange(&g_woRun, 0);
+            Sleep(60);
+            if (g_woClient) g_woClient->Stop();
+            if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
+            if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
+            if (g_woEvent) { CloseHandle(g_woEvent); g_woEvent = NULL; }
+            InterlockedExchange(&g_woState, 0);
+            InterlockedExchange(&g_woCbs, 0);
+            InterlockedExchange(&g_woUnder, 0);
+            return FALSE;
+        }
+        Log("[wo] exclusive self-test OK: %.0f fr/s (%.1f%%)", rate, 100.0 * rate / 44100.0);
+    }
+    return TRUE;
+}
+
 /* ------------- Initialize: param rewrite ------------- */
 
 static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHAREMODE shareMode,
     DWORD flags, REFERENCE_TIME hnsBufferDuration, REFERENCE_TIME hnsPeriodicity,
     const WAVEFORMATEX* pFormat, LPCGUID audioSessionGuid)
 {
-    int fixed1 = 0, fixed2 = 0;
+    int fixed1 = 0, fixed2 = 0, excl2 = 0, fake = 0;
 
     if (g_orig == NULL) return E_FAIL;
     InterlockedIncrement(&g_initCalls);
@@ -816,7 +1425,25 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
         {
             fixed1 = 1;
 
-            flags = 0x00040000u;
+            if (g_fakeClient)
+            {
+                fake = 1;                 /* v13: CRI gets our client, no real stream */
+            }
+            else if (g_exclusive2)
+            {
+                /* experimental: EXCLUSIVE + polling (EVENTCALLBACK removed).
+                   duration 10 ms, periodicity 5 ms (Focusrite minimum). */
+                shareMode = AUDCLNT_SHAREMODE_EXCLUSIVE;
+                flags = 0;
+                hnsBufferDuration = 50000;    /* 5.000 ms (v4-proven buffer size) */
+                hnsPeriodicity = 50000;       /* 5.000 ms */
+                excl2 = 1;
+                Log("[ec] exclusive2 -> EXCLUSIVE + polling, dur=per=5ms");
+            }
+            else
+            {
+                flags = 0x00040000u;
+            }
         }
         else if (flags == 0 && pFormat->wBitsPerSample == 32 && hnsBufferDuration >= 600000)
         {
@@ -825,7 +1452,27 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
         }
     }
 
-    HRESULT hr = g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
+    HRESULT hr = fake ? FakeInit(self, pFormat)
+                      : g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
+
+    /* exclusive2: record buffer/period, start the pseudo-EC driver once */
+    if (excl2 && SUCCEEDED(hr) && self != NULL)
+    {
+        UINT32 bf = 0;
+        if (SUCCEEDED(self->GetBufferSize(&bf)))
+        {
+            InterlockedExchange(&g_s1BufFrames, (LONG)bf);
+            InterlockedExchange(&g_s1PeriodFrames, (LONG)(44100 * 5 / 1000));
+            Log("[ec] exclusive2 granted buffer = %u frames (%.2f ms), period=%ld frames",
+                bf, bf * 1000.0 / 44100.0, (long)g_s1PeriodFrames);
+        }
+        if (InterlockedCompareExchange(&g_pseudoEC, 1, 0) == 0)
+        {
+            HANDLE t = CreateThread(NULL, 0, PseudoECThread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            else { InterlockedExchange(&g_pseudoEC, 0); Log("[ec] !! driver thread failed"); }
+        }
+    }
 
     UINT32 bufFrames = 0;
     REFERENCE_TIME sLat = 0;
@@ -835,9 +1482,16 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
         if (FAILED(self->GetStreamLatency(&sLat))) sLat = 0;
     }
 
-    if (fixed1) Log("stream1 FIX: flags 0x00140000 -> 0x00040000 (RATEADJUST removed)  hr=0x%08X %s",
-                    (unsigned)hr, HrBrief(hr));
-    if (fixed1) Log("stream1 -> engine granted buffer = %u frames (%.2f ms)  streamLatency=%.2f ms",
+    if (fake)
+        Log("stream1 v13: FAKE client (no engine buffer, no device hold)  hr=0x%08X %s  buffer=%u fr",
+            (unsigned)hr, HrBrief(hr), bufFrames);
+    else if (excl2)
+        Log("stream1 exclusive2: EXCLUSIVE+polling  hr=0x%08X %s  buffer=%u fr (%.2f ms)  latency=%.2f ms",
+            (unsigned)hr, HrBrief(hr), bufFrames, bufFrames * 1000.0 / 44100.0, sLat / 10000.0);
+    else if (fixed1)
+        Log("stream1 FIX: flags 0x00140000 -> 0x00040000 (RATEADJUST removed)  hr=0x%08X %s",
+            (unsigned)hr, HrBrief(hr));
+    if (fixed1 && !excl2) Log("stream1 -> engine granted buffer = %u frames (%.2f ms)  streamLatency=%.2f ms",
                     bufFrames, bufFrames * 1000.0 / 44100.0, sLat / 10000.0);
     if (fixed2) Log("stream2 FIX: duration -> 166666 (was >=600000)  hr=0x%08X %s",
                     (unsigned)hr, HrBrief(hr));
@@ -861,7 +1515,24 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
         if (MuteSession(FALSE))
             Log("[fix] cleared stale session-mute residue (v10d era)");
 
-        if (g_asioEn)
+        if (fake && g_outMode != 0)
+        {
+            Log("[out] stream1 ready -> WASAPI %s backend", g_outMode == 1 ? "EXCLUSIVE" : "SHARED");
+            if (!WoStart(g_outMode == 1))
+            {
+                Log("[out] !! %s backend failed -> trying shared", g_outMode == 1 ? "exclusive" : "shared");
+                if (!WoStart(0))
+                {
+                    Log("[out] !! shared failed -> falling back to ASIO");
+                    if (g_asioEn && InterlockedCompareExchange(&g_asioStartReq, 1, 0) == 0)
+                    {
+                        HANDLE t = CreateThread(NULL, 0, AsioStartThread, NULL, 0, NULL);
+                        if (t) CloseHandle(t);
+                    }
+                }
+            }
+        }
+        else if (g_asioEn && !excl2)
         {
             if (InterlockedCompareExchange(&g_asioStartReq, 1, 0) == 0)
             {
@@ -908,6 +1579,12 @@ static void ReadConfig(void)
             while (j > 0 && (g_asioMatch[j - 1] == ' ' || g_asioMatch[j - 1] == '\t')) j--;
             g_asioMatch[j] = '\0';
         }
+        else if (_stricmp(key, "output") == 0)
+        {
+            if (_strnicmp(v, "excl", 4) == 0)        g_outMode = 1;
+            else if (_strnicmp(v, "shared", 6) == 0) g_outMode = 2;
+            else                                     g_outMode = 0;   /* asio */
+        }
         else
         {
             int val = atoi(v);
@@ -915,6 +1592,8 @@ static void ReadConfig(void)
             else if (_stricmp(key, "block") == 0) g_asioBlock = val;
             else if (_stricmp(key, "mute_mode") == 0) g_muteMode = val;
             else if (_stricmp(key, "handoff_ms") == 0) g_handoffMs = val;
+            else if (_stricmp(key, "exclusive2") == 0) g_exclusive2 = val;
+            else if (_stricmp(key, "fake_client") == 0) g_fakeClient = val;
         }
         const char* nl = strchr(eq, '\n');
         p = nl ? nl + 1 : NULL;
@@ -923,8 +1602,15 @@ static void ReadConfig(void)
     if (g_asioBlock > 1024) g_asioBlock = 1024;
     if (g_handoffMs < 0) g_handoffMs = 0;
     if (g_handoffMs > 150) g_handoffMs = 150;
-    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s'",
-        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch);
+    if (g_outMode != 0 && !g_fakeClient)
+    {
+        Log("!! output=%s requires fake_client=1 -> falling back to ASIO path",
+            g_outMode == 1 ? "excl" : "shared");
+        g_outMode = 0;
+    }
+    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s' | exclusive2=%d fake_client=%d | output=%s",
+        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch, g_exclusive2, g_fakeClient,
+        g_outMode == 0 ? "asio" : (g_outMode == 1 ? "excl" : "shared"));
 }
 
 /* --------------------- boot device watchdog --------------------- */
@@ -1073,7 +1759,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v11.3 (v11.2 + robustness: tap-steady timeout, no I/O in realtime cb)");
+    Log(" audio_hook v13.0 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService (+RC lazy)");
     Log("============================================================");
@@ -1115,8 +1801,9 @@ extern "C" __declspec(dllexport) void PreInit(void)
 
     BOOL ok3  = PatchSlot(vt,  3, (void*)&Hook_Initialize, (void**)&g_orig);
     BOOL ok14 = PatchSlot(vt, 14, (void*)&Hook_GetService, (void**)&oGS);
-    Log("hooked: [3]=%s (orig=%p)  [14]=%s",
-        ok3 ? "OK" : "FAIL", g_orig, ok14 ? "OK" : "FAIL");
+    BOOL ok13 = (g_exclusive2 || g_fakeClient) ? PatchSlot(vt, 13, (void*)&Hook_SetEventHandle, (void**)&oSEH) : FALSE;
+    Log("hooked: [3]=%s (orig=%p)  [14]=%s  [13]=%s (exclusive2=%d fake=%d)",
+        ok3 ? "OK" : "FAIL", g_orig, ok14 ? "OK" : "FAIL", ok13 ? "OK" : "skip", g_exclusive2, g_fakeClient);
 
     /* diagnostic: listen to device notifications */
     g_notifier = new NotifyLogger();
