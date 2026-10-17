@@ -49,6 +49,18 @@ static double          g_phase = 0.0;
 static double          g_env = 0.0;      /* fade-in envelope 0..1 */
 static double          g_envStep = 0.0;
 static volatile LONG   g_playing = 0;
+static int             g_postOut = 0;    /* driver accepts outputReady() */
+
+/* bytes per sample frame for a given ASIO sample type. */
+static size_t FrameBytes(long type)
+{
+    switch (type) {
+    case ASIOSTInt16LSB: case ASIOSTInt16MSB: return 2;
+    case ASIOSTInt24LSB: case ASIOSTInt24MSB: return 3;
+    case ASIOSTFloat64LSB: case ASIOSTFloat64MSB: return 8;
+    default: return 4;   /* int32 / float32 / int32LSB16-24 */
+    }
+}
 
 static void WriteTone(void* p, long type, long block)
 {
@@ -70,8 +82,19 @@ static void WriteTone(void* p, long type, long block)
         float* o = (float*)p;
         for (long i = 0; i < block; i++) o[i] = (float)(sin(ph0 + w * i) * a);
     } break;
+    case ASIOSTFloat64LSB: {
+        double* o = (double*)p;
+        for (long i = 0; i < block; i++) o[i] = sin(ph0 + w * i) * a;
+    } break;
+    case ASIOSTInt24LSB: {
+        unsigned char* o = (unsigned char*)p;
+        for (long i = 0; i < block; i++) {
+            int32_t v = (int32_t)(sin(ph0 + w * i) * a * 8388607.0);
+            o[i * 3] = (unsigned char)v; o[i * 3 + 1] = (unsigned char)(v >> 8); o[i * 3 + 2] = (unsigned char)(v >> 16);
+        }
+    } break;
     default:
-        memset(p, 0, (size_t)block * 4);
+        memset(p, 0, FrameBytes(type) * (size_t)block);
         break;
     }
     g_phase = ph0 + w * block;
@@ -86,9 +109,9 @@ static void cbBufferSwitch(long index, ASIOBool direct)
         void* b = g_bufs[c].buffers[index];
         if (!b) continue;   /* single-buffer or malformed driver */
         if (g_playing) WriteTone(b, g_ci[c].type, g_block);
-        else memset(b, 0, (size_t)g_block * 4);
+        else memset(b, 0, FrameBytes(g_ci[c].type) * (size_t)g_block);
     }
-    if (g_asio) g_asio->outputReady();
+    if (g_postOut && g_asio) g_asio->outputReady();
 }
 
 static long cbAsioMessage(long selector, long value, void* msg, double* opt)
@@ -156,8 +179,15 @@ static int TestTone(const char* clsid, int seconds)
         if (nout < 2) goto done;
         long mn = 0, mx = 0, pr = 0, gr = 0;
         asio->getBufferSize(&mn, &mx, &pr, &gr);
-        g_block = pr > 0 ? pr : 512;
+        /* clamp to a legal block size (respect min/max and granularity). */
+        g_block = pr > 0 ? pr : (mn > 0 ? mn : 512);
+        if (gr > 0) g_block = mn + ((g_block - mn + gr - 1) / gr) * gr;
+        else if (gr < 0) { long b = mn; while (b < g_block && b < mx) b <<= 1; g_block = b; }
+        if (g_block < mn) g_block = mn;
+        if (g_block > mx) g_block = mx;
         double sr = 0; asio->getSampleRate(&sr); if (sr > 0) g_rate = sr;
+
+        g_postOut = (asio->outputReady() == ASE_OK) ? 1 : 0;
 
         memset(&g_bufs, 0, sizeof(g_bufs));
         for (int c = 0; c < 2; c++) { g_bufs[c].isInput = ASIOFalse; g_bufs[c].channelNum = c; }
@@ -172,7 +202,7 @@ static int TestTone(const char* clsid, int seconds)
         }
         for (long h = 0; h < 2; h++)
             for (int c = 0; c < 2; c++)
-                memset(g_bufs[c].buffers[h], 0, (size_t)g_block * 4);
+                memset(g_bufs[c].buffers[h], 0, FrameBytes(g_ci[c].type) * (size_t)g_block);
 
         g_asio = asio;
         g_phase = 0.0;
