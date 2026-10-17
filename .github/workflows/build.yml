@@ -1,5 +1,8 @@
 name: Build audio_hook.dll
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
