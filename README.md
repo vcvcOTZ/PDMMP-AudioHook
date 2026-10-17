@@ -28,6 +28,7 @@ Only COM **vtable** slots are patched — the executable is left byte-for-byte u
 - [Companion tools](#companion-tools)
 - [Building from source](#building-from-source)
 - [Known limitations](#known-limitations)
+- [Changelog](CHANGELOG.md)
 - [中文说明](#中文说明)
 - [License](#license)
 
@@ -237,11 +238,114 @@ Logs: `audio_hook.log` (main), `audio_hook_detach.log` (detach diagnostics).
 
 ## Companion tools
 
-| Tool | Purpose |
+Three small console tools ship with the mod, in `tools/` (also attached to every
+[Release](https://github.com/vcvcOTZ/PDMMP-AudioHook/releases), or build them with
+`src/build.bat`). None of them touch the game — they are read-only diagnostics, safe to
+run while the game is playing unless noted.
+
+| If you want to know… | Run |
 |---|---|
-| `tools/asio_list.exe` | Lists every ASIO driver and plays a 3 s test tone through one, so you can hear which physical output it drives (helps you set `asio_driver`). |
-| `tools/excl_rate_probe.exe` | Measures whether a device's WASAPI (exclusive or `--shared`) stream actually runs at real time. Prints delivered frames/s and the device clock rate. |
-| `tools/session_tool.exe` | Lists WASAPI sessions with mute/volume/peak, and can unmute a stuck app session. |
+| which ASIO driver is which, and what to put in `asio_driver` | `asio_list` |
+| whether WASAPI exclusive is actually usable on my device | `excl_rate_probe` |
+| why the game is silent (session muted / no peak) | `session_tool` |
+
+### `asio_list` — identify and audition ASIO drivers
+
+```
+asio_list                          interactive menu (arrow keys)
+asio_list --list                   plain text list, no menu
+asio_list --test "Focusrite USB"   play the tone on that driver directly
+asio_list --help
+```
+
+The interactive menu lists every driver registered under
+`HKLM\SOFTWARE\ASIO`; **Up/Down** moves the selection, **Enter** plays a 3 s 440 Hz
+tone on it, any key stops, **Q** quits.
+
+```
+=== ASIO Driver Test  (9 drivers) ===
+  Up/Down: select   Enter: play 3 s tone   Q: quit
+
+  [ 1] Ableton Move
+  [ 2] Ableton Push
+  [ 3] Focusrite Thunderbolt ASIO
+  [ 4] Focusrite USB ASIO          <- highlighted = selected
+  [ 5] GT-1000
+  ...
+```
+
+The tone is deliberately gentle: `0.12` amplitude with a 120 ms fade-in, so it will not
+blast your monitors. **Whichever speaker/headphone the tone comes out of is the physical
+output that driver drives** — that is the whole point of the tool.
+
+Use the printed name in `asio_driver`. Matching is a **substring** search that takes the
+**first** hit, so a short string can select the wrong driver (on a machine with both
+`Focusrite Thunderbolt ASIO` and `Focusrite USB ASIO`, writing `Focusrite` picks
+Thunderbolt). Always copy the full name.
+
+Drivers that crash on load (some Ableton builds do) are caught with SEH, reported as
+`CRASH`, and skipped — one bad driver cannot take down the tool.
+
+### `excl_rate_probe` — is exclusive mode real on this device?
+
+```
+excl_rate_probe --list
+excl_rate_probe "<device substring>" [--seconds N] [--shared]
+```
+
+Defaults: the **default render endpoint**, **2 s per format**. It tries every plausible
+format (44.1 / 48 kHz × 16 / 24 / 32-bit float), re-activates the client for each one,
+and only trusts a format if the **device clock really advances** — `Initialize()`
+returning `S_OK` proves nothing.
+
+```
+-- 44100 Hz / 16 bit / 2 ch --
+   initialized: buffer 441 fr (10.00 ms) - measuring...
+   -> written 43773 fr/s, device clock 43950 fr/s (99.7% of 44100)
+
+== SUMMARY 'Focusrite USB Audio'
+   best: 44100 Hz / 16 bit / 2 ch  buffer 441 fr  ->  99.7% of real time
+```
+
+| Line | Meaning |
+|---|---|
+| `written … fr/s` | frames the tool actually pushed into the buffer |
+| `device clock … fr/s` | how fast `IAudioClock` advanced — **the honest number** |
+| `not supported (0x88890008)` | the driver refuses that format in exclusive mode |
+| `Initialize 0x88890019` | buffer size not aligned; the tool retries aligned, then moves on |
+
+How to read the summary:
+
+- **≥ 95 %** — exclusive is genuinely usable; `output = excl` will keep it.
+- **90–95 %** — marginal: the queue slowly drains or fills, expect drift/stutter.
+- **< 50 %** — the driver accepted the stream but never starts the hardware clock;
+  exclusive cannot be used on that device.
+
+That last case is exactly why the mod runs a **600 ms self-test** on `excl` and rolls
+back to `shared` below 95 %. `--shared` runs the same measurement on a normal shared
+stream, which is the quickest way to prove an endpoint is alive at all.
+
+### `session_tool` — session mute / volume / peak inspector
+
+```
+session_tool                    list sessions on every render device
+session_tool --unmute <substr>  clear mute on every session whose process name matches
+session_tool --mute <substr>    set mute (diagnostic only)
+```
+
+```
+== device 'Focusrite USB Audio' [{...}]
+    session pid=16672  DivaMegaMix.exe   [Active] muted=no volume=1.00 peak=0.4182
+    session pid=13564  msedge.exe        [Inactive] muted=no volume=1.00 peak=0.0000
+```
+
+`peak` is the live `IAudioMeterInformation` value — the fastest way to tell "the game has
+an active stream but is outputting digital silence" (state `Active`, `peak=0.0000`) from
+"the game is simply not playing anything".
+
+Run it **while the game is running** — the session only exists then. `--unmute DivaMegaMix`
+fixes the persistent per-app mute that builds before v11.1 could leave behind (Windows
+remembers that state per executable path, including after the mod is removed).
 
 ---
 
@@ -281,6 +385,11 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 - **独占实测结论**：Focusrite 设备时钟只有 88.5%、板载 Realtek 只有 0.3% —— 驱动接受独占流但不真正跑，所以**独占不适合当主推**，本模组会自动降级。
 - **安装**：`Audio Hook` 文件夹放进 `mods/`，根 `config.toml` 的 `priority` 加 `"Audio Hook"`。
 - **急救**：同目录放空文件 `audio_hook.off`；或 `fake_client = 0` + `asio = 0` 回到旧的纯 WASAPI 优化。
+- **配套工具**（`tools/`，也可从 Release 下载）：
+  - `asio_list` —— 列出本机所有 ASIO 驱动，↑↓ 选择、回车播放 3 秒测试音，**哪个声卡出声就是它**；`--list` 纯列表、`--test "名字"` 直接试听。填进 `asio_driver` 的就是它显示的名字（要用完整名，子串匹配取第一个）。
+  - `excl_rate_probe` —— 测某设备的独占/共享流**是否真的实时**：`excl_rate_probe --list`、`excl_rate_probe Realtek --seconds 2`、`excl_rate_probe default --shared`。看 `device clock` 的百分比：≥95% 可用、90~95% 勉强、<50% 驱动根本没启动硬件。
+  - `session_tool` —— 会话诊断：不带参数列出各设备所有音频会话（状态/静音/音量/峰值）；`--unmute DivaMegaMix` 清除旧版遗留的持久静音（需游戏运行中执行）。
+- **更新日志**：见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
