@@ -1164,7 +1164,6 @@ static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
     g_fake.fmt.cbSize = 0;
     g_fake.ev = NULL;
     InterlockedExchange(&g_fake.running, 0);
-    InterlockedExchange(&g_fake.on, 1);
 
     if (!g_fakePatched)
     {
@@ -1183,6 +1182,9 @@ static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
         Log("[fake] vtable slots 4..12 patched: %s", ok ? "OK" : "FAIL");
         if (!ok) return E_FAIL;
     }
+
+    /* only now is it safe for the hooks to treat this client as ours */
+    InterlockedExchange(&g_fake.on, 1);
 
     Log("[fake] stream1 client replaced: %u Hz / %u bit / %u ch, %u frames",
         (unsigned)g_fake.fmt.nSamplesPerSec, (unsigned)g_fake.fmt.wBitsPerSample,
@@ -1205,6 +1207,7 @@ static UINT32              g_woFrames = 0;
 static int                 g_woFloat  = 0;
 static int                 g_woCh     = 2;   /* output channel count */
 static volatile LONG       g_woRun    = 0;
+static volatile LONG       g_woAlive  = 0;   /* WoThread is inside its loop */
 
 static void WoFill16(BYTE* p, UINT32 n)
 {
@@ -1253,6 +1256,7 @@ static void WoFillFloat(BYTE* p, UINT32 n)
 
 static DWORD WINAPI WoThread(LPVOID)
 {
+    InterlockedExchange(&g_woAlive, 1);
     Log("[wo] thread up (frames=%u float=%d)", (unsigned)g_woFrames, g_woFloat);
     if (FAILED(g_woClient->Start()))
     {
@@ -1289,6 +1293,7 @@ static DWORD WINAPI WoThread(LPVOID)
         FakePoke();
     }
     g_woClient->Stop();
+    InterlockedExchange(&g_woAlive, 0);
     Log("[wo] thread exit");
     return 0;
 }
@@ -1389,8 +1394,11 @@ static BOOL WoStart(int exclusive)
             Log("[wo] !! exclusive self-test FAILED: %.0f fr/s (%.1f%% of 44100) - rolling back",
                 rate, 100.0 * rate / 44100.0);
             InterlockedExchange(&g_woRun, 0);
-            Sleep(60);
-            if (g_woClient) g_woClient->Stop();
+            /* wait for WoThread to leave its loop before tearing the objects down
+               (it blocks on the event for up to 200 ms) */
+            for (int i = 0; i < 400 && g_woAlive; i++) Sleep(5);
+            if (g_woAlive) Log("[wo] !! thread did not stop in 2 s - leaking objects instead of crashing");
+            if (!g_woAlive && g_woClient) g_woClient->Stop();
             if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
             if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
             if (g_woEvent) { CloseHandle(g_woEvent); g_woEvent = NULL; }
