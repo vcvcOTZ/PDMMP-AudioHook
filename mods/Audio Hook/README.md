@@ -66,7 +66,7 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 |---|---|
 | `asio` *(default)* | Native ASIO driver. Lowest, most consistent result on the test hardware. |
 | `shared` | Our own WASAPI shared-mode stream. Works on **any** device, no ASIO driver required. |
-| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (after skipping the ~70 ms clock ramp-up): if the device delivers less than 90 % of real time, the backend is torn down and the mod falls back to `shared`. |
+| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (run by the watchdog thread, overlapped with playback, and measured against real elapsed time): if the device delivers less than 90 % of real time, the backend is torn down and the mod falls back to `shared`. |
 
 With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
 registry order and keeps the first one that fully initialises — the log shows each attempt
@@ -89,7 +89,7 @@ No code bytes are written. The game's own **COM implementation** is replaced (ou
 
 - **All-or-nothing vtable patches.** Both the client takeover (9 slots) and the render-client tap (2 slots) are installed as a set; if any slot cannot be patched, the ones already written are rolled back. A half-patched table used to leave `slot 3 = our hook` while the "patched" flag stayed 0, so the next attempt hooked our own function onto itself (stack overflow).
 - **Staged fallback with real verification:** `output = excl` → `shared` → ASIO. Each stage now *waits* for its thread to report success, so a failed `Start()` no longer looks like a working backend.
-- **Exclusive self-test** (skips the ~70 ms clock ramp-up, then measures 2 s) checks both delivered frames and the **device clock** (`IAudioClock`); below 90 % of real time it tears the stream down and falls back.
+- **Exclusive self-test** (runs on the watchdog thread, overlapped with playback; the window is whatever real time has elapsed, ≥ 2 s) checks both delivered frames and the **device clock** (`IAudioClock`); below 90 % of real time it tears the stream down and falls back.
 - **Fake mode has a real fallback:** if ASIO dies while the client is faked, the mod starts the shared backend (`WoStart(0)`) instead of the old "game audio returns via WASAPI", which was impossible with no real stream.
 - **No engine handoff in fake mode:** the tap-and-zero dance (resync + 23 ms wait) is skipped, so starting a song no longer discards ~10 ms of already mixed audio.
 - **Ring memory is allocated unconditionally** and every ring access is NULL-guarded, so `fake_client = 1` + `asio = 0` (previously a guaranteed crash) now works and is auto-corrected to `output = shared`.
@@ -204,11 +204,12 @@ apps, such as an Android emulator, drag even the standalone probe down to ~96 %)
 devices are genuinely unusable: one onboard codec initialises but keeps its device clock
 at **~0.3 %**.
 
-So v13 measures the device clock at startup and rolls back to `shared` when the rate is
+So v13 measures the device clock while playing and rolls back to `shared` when the rate is
 under 90 % — which is what exclusive usually does in practice, and why it is not the
-default and not recommended. The self-test fills silence to keep the clock moving before
-the game starts mixing, skips the ~70 ms clock ramp-up, and measures over 2 s. After a
-genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the
+default and not recommended. The writer hands the device a whole period on every event
+(the tail padded with silence), so the device clock keeps moving even before the game
+starts mixing; the self-test then samples the counters over ≥ 2 s of real elapsed time.
+After a genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the
 watchdog only rebuilds `shared` — so changing `output = excl` to stick requires a game
 restart. Use `tools/excl_rate_probe.exe` to check your own device:
 
