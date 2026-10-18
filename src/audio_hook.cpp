@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.1 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.2 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -1561,10 +1561,14 @@ static DWORD WINAPI WoThread(LPVOID)
         UINT32 pad = 0;
         if (FAILED(g_woClient->GetCurrentPadding(&pad))) { Sleep(2); continue; }
         UINT32 free_ = g_woFrames > pad ? g_woFrames - pad : 0;
-        /* only write what the ring actually holds: the engine buffer can be much
-           larger than CRI's own queue (e.g. 1056 vs 441), and blindly filling the
-           whole free space would zero-pad (audible underrun) every period. */
+        /* Only write what the ring can actually produce. Two units are involved:
+           free_ is OUTPUT frames (device rate), RingAvail() is SOURCE frames
+           (44.1 kHz). When step > 1 (endpoints below 44.1 kHz, e.g. 32 kHz) one
+           output frame consumes more than one source frame, so handing `free_`
+           straight to RsPull starves the resampler and pads ~27 % of every
+           period with silence (music ran at 72.6 % speed). */
         UINT32 avail = RingAvail();
+        if (g_rsStep > 1.0) avail = (UINT32)((double)avail / g_rsStep);
         UINT32 n = free_ < avail ? free_ : avail;
         if (n)
         {
@@ -1642,6 +1646,12 @@ static BOOL WoInit(int exclusive)
             Log("[wo] endpoint is %u Hz -> resampling 44100 -> %u (linear interpolation)", rate, rate);
     }
 
+    if (rate < 8000 || rate > 384000)
+    {
+        Log("[wo] !! implausible endpoint rate %u Hz - refusing", rate);
+        goto done;
+    }
+
     REFERENCE_TIME dur = exclusive ? 50000 : 0;
     REFERENCE_TIME per = exclusive ? 50000 : 0;
     hr = g_woClient->Initialize(exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE : AUDCLNT_SHAREMODE_SHARED,
@@ -1692,7 +1702,7 @@ done:
 static void WoShutdown(void)
 {
     InterlockedExchange(&g_woRun, 0);
-    for (int i = 0; i < 400 && g_woAlive; i++) Sleep(5);   /* blocks <= 200 ms */
+    for (int i = 0; i < 400 && g_woAlive; i++) Sleep(5);   /* blocks up to 2 s */
     if (g_woAlive)
     {
         Log("[wo] !! thread did not stop within 2 s - leaking the stream objects instead of freeing them");
@@ -1835,6 +1845,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
             Log("[fake] !! takeover failed (hr=0x%08X) -> using the real WASAPI client", (unsigned)hr);
             InterlockedExchange(&g_fake.on, 0);
             fake = 0;
+            flags = 0x00040000u;   /* still drop RATEADJUST: 44.5 ms -> 22 ms */
             hr = g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
         }
     }
@@ -2179,7 +2190,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     timeBeginPeriod(1);   /* 1 ms timer resolution: Sleep(1) no longer rounds up to 15.6 ms */
 
     Log("============================================================");
-    Log(" audio_hook v13.1 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.2 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");
