@@ -51,6 +51,35 @@ createBuffers → channel format; a failure releases it and moves on. Capped at 
   fallback (shared / WASAPI) until the game is restarted; only a rebuilt stream1 client
   tries ASIO again. The comment now says that instead of promising a retry that never fires.
 
+### Fixed — `AUDIT-v13.3.md` (third-pass review)
+
+- **R1 (P1)** — ASIO retry and the shared fallback could run at the same time, both
+  `RingRead`-ing the one ring (each got half the frames → torn, pitch-shifted audio). The
+  trigger is real: ASIO fails → shared fallback starts → stream1 is rebuilt → ASIO is
+  retried and succeeds without stopping shared. `AsioStartThread` now stops the shared
+  stream (`WoShutdown`) right before `start()`, and `WoStart` refuses to start a WASAPI
+  backend while ASIO is running.
+- **R2 (P2)** — the shared backend treated every non-float mix format as int16. A shared
+  mix format of 24-bit packed or 32-bit **integer** PCM would have been written 2 bytes per
+  sample → full-scale noise. `WoInit` now refuses `!float && wBitsPerSample != 16` and lets
+  the caller fall back (the reverse of the v13.1 float-misread fix).
+- **R5** — `asio_driver` matching was case-sensitive despite the README promising
+  case-insensitive; `focusrite` missed `Focusrite USB ASIO`. Now uses a case-insensitive
+  substring (`StrIStr`).
+- **R6** — `asio_driver` now also strips single quotes, not just double quotes.
+- **R7** — `kAsioOverload` no longer calls `Log()` from the realtime callback (it counts and
+  the monitor thread reports it); the `kAsioSelectorSupported` handler no longer advertises
+  resync / latencies-changed / reset requests that it never handled.
+- **R8** — the `timeBeginPeriod(1)` result is checked before the paired `timeEndPeriod` flag
+  is set, so a failed request is not wrongly undone at detach.
+- **R12** — documented that `FakeRC::GetBuffer`'s 5×`Sleep(1)` back-pressure depends on
+  `timeBeginPeriod(1)`.
+- **R3 / R4** — documented as deliberate trade-offs: probing `*` really does `init()` each
+  driver (bounded, and pinning `asio_driver` avoids it), and exclusive is intentionally
+  never re-attempted after its self-test fails (the failure is a device property, not a
+  glitch, and exclusive is not a recommended path). R9/R10/R11 are diagnostic/leak notes
+  already marked acceptable in the source.
+
 ### Removed
 
 - `exclusive2` is gone entirely — the dead config branch, its log line, the README note and

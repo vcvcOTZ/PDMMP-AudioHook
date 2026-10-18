@@ -198,6 +198,7 @@ static volatile LONG64 g_zeroed    = 0;
 static volatile LONG64 g_ringDrops = 0;
 static volatile LONG   g_underruns = 0;
 static volatile LONG   g_asoCbs    = 0;
+static volatile LONG   g_overloads = 0;   /* kAsioOverload messages (counted, not logged) */
 static volatile LONG   g_muted     = 0;   /* legacy SetMute path state */
 static volatile LONG   g_zeroTap   = 0;   /* v11: zero the game buffer after copy */
 static volatile LONG   g_kicked    = 0;   /* stream1 died while bridging */
@@ -453,6 +454,7 @@ static void WriteSamples(void* p, long type, int ch, const short* src, unsigned 
 
 static void FakePoke(void);   /* v13, defined in the fake-client section */
 static BOOL WoStart(int exclusive);   /* v13, defined in the WASAPI-output section */
+static void WoShutdown(void);         /* v13, defined in the WASAPI-output section */
 static void RsFlush(void);            /* v13.3, drop buffered resampler frames */
 
 static void AsioFill(long index)
@@ -490,15 +492,18 @@ static long cbAsioMessage(long selector, long value, void* msg, double* opt)
     switch (selector)
     {
     case kAsioSelectorSupported:
-        if (value == kAsioEngineVersion || value == kAsioSupportsTimeInfo ||
-            value == kAsioResyncRequest || value == kAsioLatenciesChanged ||
-            value == kAsioResetRequest)
+        /* Only claim the selectors we actually handle. Advertising
+           kAsioResyncRequest / kAsioLatenciesChanged / kAsioResetRequest and
+           then ignoring them in the default branch confuses the driver; the
+           callback runs on the realtime thread, so kAsioOverload must not do
+           file I/O (audit R7). */
+        if (value == kAsioEngineVersion || value == kAsioSupportsTimeInfo)
             return 1L;
         return 0L;
     case kAsioEngineVersion:    return 2L;
     case kAsioSupportsTimeInfo: return 1L;
     case kAsioSupportsTimeCode: return 0L;
-    case kAsioOverload:         Log("[asio] !! driver overload message"); return 0L;
+    case kAsioOverload:         InterlockedIncrement(&g_overloads); return 0L;
     default:                    return 0L;
     }
 }
@@ -570,6 +575,19 @@ done:
 static int AsioMatchAny(const char* m)
 {
     return (!m || !m[0] || strcmp(m, "*") == 0 || _stricmp(m, "auto") == 0);
+}
+
+/* case-insensitive substring (README promises case-insensitive matching, but
+   plain strstr() is not - "focusrite" must match "Focusrite USB ASIO") */
+static const char* StrIStr(const char* hay, const char* needle)
+{
+    size_t nl = strlen(needle);
+    if (!nl) return hay;
+    size_t hl = strlen(hay);
+    if (hl < nl) return NULL;
+    for (size_t i = 0; i <= hl - nl; i++)
+        if (_strnicmp(hay + i, needle, nl) == 0) return hay + i;
+    return NULL;
 }
 
 /* Instantiate one driver by CLSID. Returns TRUE when g_asio is usable. */
@@ -719,7 +737,12 @@ fail:
  * at the first driver whose COM server merely answered: on a machine with
  * several registered drivers that could be a virtual mixer/loopback device, a
  * disconnected interface, or one that cannot run at 44.1 kHz - and the mod then
- * sat in "prepare failed" while a perfectly good driver was never tried. */
+ * sat in "prepare failed" while a perfectly good driver was never tried.
+ *
+ * Trade-off (audit R3): probing really does init() each candidate, and init()
+ * has side effects on some drivers (panel UI, a brief device claim). It is
+ * bounded at 8 attempts and every failure releases the driver, but a machine
+ * with many DAW-installed drivers is better off pinning asio_driver=<name>. */
 static BOOL AsioPrepare(void)
 {
     HKEY hk;
@@ -745,7 +768,7 @@ static BOOL AsioPrepare(void)
         RegCloseKey(hs);
         const char* nm = desc[0] ? desc : keyname;
         if (!clsid[0]) continue;                       /* unplayable registry entry */
-        if (!any && !strstr(nm, g_asioMatch)) continue;
+        if (!any && !StrIStr(nm, g_asioMatch)) continue;   /* case-insensitive (audit R5) */
 
         matched++;
         if (tried >= 8) { Log("[asio] !! %d matching driver(s), stopped after 8 attempts", matched); break; }
@@ -913,6 +936,13 @@ static DWORD WINAPI AsioStartThread(LPVOID)
     else
         Log("[handoff] fake client: no engine queue to drain, starting ASIO directly");
 
+    /* ASIO is about to become the ring consumer. The shared backend may still be
+       running if it was started as the fallback after an earlier ASIO failure
+       (or if the game rebuilt stream1 and re-tried ASIO). Two consumers reading
+       the same ring each grab half the frames -> torn, pitch-shifted audio on
+       both outputs (audit R1). Stop the shared stream first. */
+    if (g_woState == 3) WoShutdown();
+
     if (g_asio->start() != ASE_OK)
     {
         Log("[asio] !! start failed");
@@ -925,7 +955,7 @@ static DWORD WINAPI AsioStartThread(LPVOID)
 
     /* monitor: kick / stall / runaway underruns (runs until the process ends) */
     int stall = 0, undFail = 0;
-    LONG last = g_asoCbs, lastUnd = g_underruns;
+    LONG last = g_asoCbs, lastUnd = g_underruns, lastOvl = g_overloads;
     for (long long i = 1; i > 0; i++)
     {
         Sleep(1000);
@@ -957,6 +987,11 @@ static DWORD WINAPI AsioStartThread(LPVOID)
             }
         }
         else undFail = 0;
+        if (g_overloads != lastOvl)          /* report from the monitor thread, */
+        {                                    /* never from the realtime callback */
+            Log("[asio] !! driver overload message (total %ld)", g_overloads);
+            lastOvl = g_overloads;
+        }
         if (i <= 20 || (i % 60) == 0)
             Log("[asio] t=%llds cbs=%ld und=%ld avail=%u zeroTap=%ld muted=%ld",
                 i, g_asoCbs, g_underruns, RingAvail(), g_zeroTap, g_muted);
@@ -1181,7 +1216,10 @@ public:
         /* Back-pressure: give the consumer a few ms to drain instead of
            answering "buffer too large" (an error with a different meaning that
            only worked because CRI tolerates it). This runs on CRI's mixing
-           thread, never on a realtime callback, so a short wait is safe. */
+           thread, never on a realtime callback, so a short wait is safe.
+           Sleep(1) here is only ~1 ms because PreInit() calls timeBeginPeriod(1)
+           - if that is ever removed, each Sleep(1) becomes ~15.6 ms and this
+           wait balloons to ~78 ms on the mixing thread (audit R12). */
         for (int i = 0; i < 5 && RingAvail() + n > FAKE_FRAMES; i++) Sleep(1);
         if (RingAvail() + n > FAKE_FRAMES)
         {
@@ -1774,6 +1812,17 @@ static BOOL WoInit(int exclusive)
             g_woFloat = IsEqualGUID(((const WAVEFORMATEXTENSIBLE*)wf)->SubFormat, kSubFloat) ? 1 : 0;
         else
             g_woFloat = (wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ? 1 : 0;
+        /* WoFill16() only knows 16-bit integer and WoFillFloat() only 32-bit
+           float. A shared mix format of 24-bit packed or 32-bit INTEGER PCM
+           would otherwise be written 2 bytes per sample -> full-scale noise
+           (the exact reverse of the v13.1 float-misread fix). Refuse and let
+           the caller fall back to another backend (audit R2). */
+        if (!g_woFloat && wf->wBitsPerSample != 16)
+        {
+            Log("[wo] !! shared mix format is %u-bit integer PCM (only 16-bit int / 32-bit float supported) - refusing",
+                wf->wBitsPerSample);
+            goto done;
+        }
         if (rate != 44100)
             Log("[wo] endpoint is %u Hz -> resampling 44100 -> %u (linear interpolation)", rate, rate);
     }
@@ -1856,10 +1905,27 @@ static void WoShutdown(void)
    healthy while the hardware is not moving. */
 static BOOL WoStart(int exclusive)
 {
+    /* ASIO and the WASAPI backend must never run at once: both read the same
+       ring and each would grab half the frames (audit R1). AsioRollback calls
+       us AFTER setting g_asioState=4, so this only rejects an external caller
+       that tries to start a WASAPI stream while ASIO is already running. */
+    if (g_asioState == 3)
+    {
+        Log("[wo] !! ASIO is running - refusing to start a WASAPI backend (would double-consume the ring)");
+        return FALSE;
+    }
+
     BOOL claimed = FALSE;
     for (int spin = 0; spin < 400; spin++)
     {
         LONG st = g_woState;
+        /* A running backend is accepted as-is. This also means that if
+           exclusive's self-test failed and the mod fell back to shared, a later
+           re-try of exclusive sees state==3 and returns here without testing
+           again - exclusive is never re-attempted for the rest of the process
+           (audit R4). That is deliberate: the self-test failure is usually a
+           hardware rate below 95 % (a property of the device, not a glitch),
+           and exclusive is not a recommended path. */
         if (st == 3) return TRUE;
         if (st == 0 || st == 4)     /* 4 = previous failure; allow a retry */
         {
@@ -2102,11 +2168,13 @@ static void ReadConfig(void)
 
             if (_stricmp(key, "asio_driver") == 0)
             {
-                /* tolerate asio_driver = "*" - the docs quote the value, so
-                   people paste the quotes too */
+                /* tolerate asio_driver = "*" / 'name' - the docs quote the value,
+                   so people paste the quotes too (audit R6) */
                 char* s = v;
                 size_t L = strlen(s);
-                if (L >= 2 && s[0] == '"' && s[L - 1] == '"') { s[L - 1] = '\0'; s++; }
+                if (L >= 2 && ((s[0] == '"' && s[L - 1] == '"') ||
+                               (s[0] == '\'' && s[L - 1] == '\'')))
+                { s[L - 1] = '\0'; s++; }
                 strncpy_s(g_asioMatch, sizeof(g_asioMatch), s, _TRUNCATE);
             }
             else if (_stricmp(key, "output") == 0)
@@ -2370,9 +2438,10 @@ extern "C" __declspec(dllexport) void PreInit(void)
     }
 
     /* Only when we are really running: this raises the timer resolution for the
-       whole system, and DllMain gives it back at detach (audit N11). */
-    g_timerPeriod = 1;
-    timeBeginPeriod(1);   /* 1 ms timer resolution: Sleep(1) no longer rounds up to 15.6 ms */
+       whole system, and DllMain gives it back at detach (audit N11). Set the
+       flag only when the call actually succeeded, so a failed request is not
+       undone at detach (audit R8). */
+    g_timerPeriod = (timeBeginPeriod(1) == TIMERR_NOERROR) ? 1 : 0;
 
     g_sessionActive = 1;
     ReadConfig();
