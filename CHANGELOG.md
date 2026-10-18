@@ -31,7 +31,8 @@ createBuffers → channel format; a failure releases it and moves on. Capped at 
   `GetCurrentPadding` just looped on `Sleep(2)` forever, with no log line and the state
   stuck at "running". The usual cause is Windows switching the default device when
   headphones are plugged/unplugged. The writer now bails out and marks the backend failed;
-  a watchdog rebuilds the shared stream (3 s backoff, 5 attempts) and logs every attempt.
+  a watchdog rebuilds the shared stream (3 s apart for the first 5 tries, then every 30 s
+  until it recovers) and logs every attempt.
 - **N22** — `Int16MSB` / `Int24MSB` / `Int32MSB*` / `Float32MSB` / `Float64*` passed the
   "unsupported format" gate but had no writer, so the mod announced a healthy format and
   played silence. Preparation now checks an `IsTypeRenderable()` whitelist instead.
@@ -45,12 +46,16 @@ createBuffers → channel format; a failure releases it and moves on. Capped at 
 - **N12** — a truncated log line was dropped whole (`_snprintf_s` returns -1); it now
   writes what fits.
 - **N9** — documented that the fake `GetCurrentPadding` counts source frames.
-- **N26** — the watchdog really retries now (see N6).
+- **N26** — the misleading "allow a later retry" comments on `g_asioStartReq` are gone.
+  There is deliberately **no active ASIO re-try**: once ASIO fails the mod stays on the
+  fallback (shared / WASAPI) until the game is restarted; only a rebuilt stream1 client
+  tries ASIO again. The comment now says that instead of promising a retry that never fires.
 
 ### Removed
 
-- `exclusive2` no longer appears in the shipped `audio_hook.txt`. The key is still
-  tolerated (logged once, then ignored) so old configs keep working.
+- `exclusive2` is gone entirely — the dead config branch, its log line, the README note and
+  the stale "allow a later retry" comments on `g_asioStartReq` were removed. An old config
+  that still sets the key now falls through to the generic `unknown key` line and is ignored.
 
 ### Docs
 

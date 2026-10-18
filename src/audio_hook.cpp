@@ -793,7 +793,7 @@ static void AsioRollback(const char* why)
     if (g_muted) { MuteSession(FALSE); InterlockedExchange(&g_muted, 0); }
     AsioTeardown();
     InterlockedExchange(&g_asioState, 4);
-    InterlockedExchange(&g_asioStartReq, 0);         /* allow a later retry */
+    InterlockedExchange(&g_asioStartReq, 0);         /* a rebuilt stream1 may try ASIO again */
 
     if (g_fakeClient)
     {
@@ -857,7 +857,7 @@ static DWORD WINAPI AsioStartThread(LPVOID)
     if (!AsioPrepare())
     {
         InterlockedExchange(&g_asioState, 4);
-        InterlockedExchange(&g_asioStartReq, 0);   /* a later retry must be possible */
+        InterlockedExchange(&g_asioStartReq, 0);   /* a rebuilt stream1 may try ASIO again */
         if (g_fakeClient)
         {
             Log("[asio] !! prepare failed -> falling back to WASAPI shared output");
@@ -2115,11 +2115,6 @@ static void ReadConfig(void)
                 else if (_strnicmp(v, "shared", 6) == 0) g_outMode = 2;
                 else                                     g_outMode = 0;   /* asio */
             }
-            else if (_stricmp(key, "exclusive2") == 0)
-            {
-                if (atoi(v) != 0)
-                    Log("config: exclusive2 was removed in v13 (no device could run it) - ignored");
-            }
             else
             {
                 int val = atoi(v);
@@ -2202,8 +2197,11 @@ static void DeviceProbeOnce(const char* phase)
 
 /* A dead output stream used to mean permanent silence. WoThread now bails out
    with state 4; this brings the stream back - the usual cause is Windows
-   switching the default endpoint when headphones are plugged/unplugged. Capped
-   and backed off so a genuinely broken device cannot spin the init path. */
+   switching the default endpoint when headphones are plugged/unplugged. The
+   first few attempts are fast (3 s apart); if the device stays gone the retry
+   slows to once per 30 s and keeps trying, so audio comes back on its own once
+   the endpoint returns - instead of giving up after 5 tries and staying silent
+   until the game is restarted. */
 static volatile LONG g_woRetry = 0;
 static volatile ULONGLONG g_woNextTry = 0;
 
@@ -2211,12 +2209,14 @@ static void WoWatchdog(void)
 {
     if (!g_fakeClient) return;                  /* legacy tap path reclaims WASAPI itself */
     if (g_woState != 4) { g_woRetry = 0; g_woNextTry = 0; return; }
-    if (g_woRetry >= 5) return;
     if (GetTickCount64() < g_woNextTry) return;
+
+    if (g_woRetry < 5) g_woNextTry = GetTickCount64() + 3000;    /* fast phase  */
+    else               g_woNextTry = GetTickCount64() + 30000;   /* slow phase  */
+
     g_woRetry++;
-    g_woNextTry = GetTickCount64() + 3000;
-    Log("[wo] watchdog: output backend is down -> restarting shared (attempt %ld)",
-        (long)g_woRetry);
+    Log("[wo] watchdog: output backend is down -> restarting shared (attempt %ld)%s",
+        (long)g_woRetry, g_woRetry > 5 ? " [slow]" : "");
     if (!WoStart(0)) Log("[wo] !! watchdog restart failed");
 }
 

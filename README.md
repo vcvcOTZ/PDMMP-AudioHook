@@ -414,7 +414,6 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.
-- `exclusive2` from older configs is **ignored** (it was removed in v13 and cannot work on any tested device); the mod logs a line when it sees the key.
 
 ---
 
