@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.7-informational)
+![Version](https://img.shields.io/badge/version-v13.9-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 把游戏的音频**客户端**（不是代码）整个换掉，让引擎缓冲从链路里消失，再把游戏的 PCM 通过你选择的后端渲染出去：**ASIO**、**WASAPI 独占**或 **WASAPI 共享**。
@@ -65,7 +65,7 @@ v13 走了另一条路：**把 CRI 交给一个由本模组拥有的客户端对
 |---|---|
 | `asio` *（默认）* | 原生 ASIO 驱动。测试硬件上延迟最低、最稳定。 |
 | `shared` | 我们自己开一条 WASAPI 共享流。**任何**设备都可用，无需 ASIO 驱动。 |
-| `excl` | WASAPI 独占，使用设备默认周期（10 ms）。带 **2 秒自检**（跳过 ~70 ms 时钟起步）：设备交付不足实时 95% 时拆掉后端、回退到 `shared`。 |
+| `excl` | WASAPI 独占，使用设备默认周期（10 ms）。带 **2 秒自检**（跳过 ~70 ms 时钟起步）：设备交付不足实时 90% 时拆掉后端、回退到 `shared`。 |
 
 `asio_driver = *`（默认）时，ASIO 后端按注册表顺序逐个尝试已注册驱动，保留第一个能完整初始化的——日志会写明每次尝试和最终选中的驱动，所以装了多个驱动的机器不会被悄悄路由到断开的或虚拟设备。探测会真的 `init()` 每个候选（上限 8 个），有些驱动在此过程中会弹控制面板或短暂抢占设备，所以装了多个 ASIO 驱动（ASIO4ALL、FlexASIO、虚拟声卡等）的机器，建议先跑一次 `asio_list`，把声卡名字填进 `asio_driver` 以跳过探测。
 
@@ -82,7 +82,7 @@ v13 走了另一条路：**把 CRI 交给一个由本模组拥有的客户端对
 
 - **vtable 补丁全有或全无。** 客户端接管（9 个槽）和渲染客户端 tap（2 个槽）都作为一组安装；任一槽打不上，已写的槽会被回滚。半补丁表曾导致 `slot 3 = 我们的 hook` 而 "patched" 标志仍为 0，下一次尝试就把自己的函数 hook 到自己头上（栈溢出）。
 - **带真实验证的分级回退：** `output = excl` → `shared` → ASIO。每一级现在都会*等待*其线程报告成功，`Start()` 失败不再被当成后端正常。
-- **独占自检**（跳过 ~70 ms 时钟起步、测 2 秒）同时检查已交付帧和**设备时钟**（`IAudioClock`）；低于实时 95% 就拆流回退。
+- **独占自检**（跳过 ~70 ms 时钟起步、测 2 秒）同时检查已交付帧和**设备时钟**（`IAudioClock`）；低于实时 90% 就拆流回退。
 - **fake 模式有真正的兜底：** 客户端被接管后若 ASIO 挂了，模组会启动 shared 后端（`WoStart(0)`），而不是旧的"游戏音频退回 WASAPI"——没有真实流时那是不可能的。
 - **fake 模式无引擎交接：** 跳过 tap-and-zero 流程（重同步 + 23 ms 等待），切歌不再丢弃约 10 ms 已混好的音频。
 - **环形缓冲无条件分配**，所有环形访问都有 NULL 守卫，所以 `fake_client = 1` + `asio = 0`（以前必崩）现在能工作，并自动纠正为 `output = shared`。
@@ -140,7 +140,7 @@ v13 走了另一条路：**把 CRI 交给一个由本模组拥有的客户端对
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. 启动游戏，查看 `mods/Audio Hook/audio_hook.log`——表头应显示 `v13.7` 和 `MODE: v13 takeover`。
+4. 启动游戏，查看 `mods/Audio Hook/audio_hook.log`——表头应显示 `v13.9` 和 `MODE: v13 takeover`。
 
 ---
 
@@ -167,6 +167,7 @@ mute_mode   = 1
 | `block` | `64` | ASIO 块大小（16…1024）。 |
 | `handoff_ms` | `0` | 交接延迟；`0` = 自动。 |
 | `mute_mode` | `1` | `1` = tap-and-zero 交接；`0` = 旧版 `SetMute`。 |
+| `excl_period_ms` | `0` | 独占后端的事件周期（ms）；`0` = 设备默认（10 ms）；只有 `0` 可用——见 `excl` 一节。 |
 
 ---
 
@@ -188,12 +189,14 @@ mute_mode   = 1
 
 独占的弱点在于它的软件事件循环**对系统/后台负载敏感**。干净地单独跑 `excl_rate_probe` 能达到约 **99.5%** 的实时速率，但在游戏内通常只有 **~94.5%**（而吃 CPU 的后台程序——比如安卓模拟器——能把独立探测都从 99.5% 拖到 ~96%）。有些设备则真的不能用：一块板载 codec 能初始化，但**设备时钟几乎停在 ~0.3%**。
 
-所以 v13 启动时会测设备时钟，速率低于 95% 就回退到 `shared`——而游戏内独占通常就是会这样回退，这也是它不做默认、不做推荐的原因。自检会先填静音让时钟在游戏开始混音前保持推进、跳过 ~70 ms 时钟起步、再测 2 秒。真正回退之后，本次进程生命周期内独占**不再重试**——看门狗只重建 `shared`——所以想让 `output = excl` 生效需要重启游戏。用 `tools/excl_rate_probe.exe` 检查你的设备：
+所以 v13 启动时会测设备时钟，速率低于 90% 就回退到 `shared`——而游戏内独占通常就是会这样回退，这也是它不做默认、不做推荐的原因。自检会先填静音让时钟在游戏开始混音前保持推进、跳过 ~70 ms 时钟起步、再测 2 秒。真正回退之后，本次进程生命周期内独占**不再重试**——看门狗只重建 `shared`——所以想让 `output = excl` 生效需要重启游戏。用 `tools/excl_rate_probe.exe` 检查你的设备：
 
 ```
 excl_rate_probe --list
 excl_rate_probe "Speakers" --seconds 2
 ```
+
+独占后端始终按设备的默认周期（10 ms）运行。配置键 `excl_period_ms` 可覆盖该周期，但**任何**高于设备默认值的取值都会让设备停止触发事件回调——流被作废并回退到 `shared`——所以实际上只有 `0`（设备默认）可用。因为 10 ms 缓冲没有余量，独占仍保留少量残余风险，依旧不推荐（推荐后端是 `asio`）。
 
 ---
 
@@ -324,7 +327,7 @@ excl_rate_probe "<设备子串>" [--seconds N] [--shared]
 - **90–95%** —— 勉强：队列缓慢变空或变满，预期会有漂移/卡顿。
 - **< 50%** —— 驱动接受了流但从未启动硬件时钟；该设备上无法用独占。
 
-最后这种情况正是模组对 `excl` 跑 **2 秒自检**、低于 95% 就回退 `shared` 的原因。`--shared` 在普通共享流上跑同样的测量，是最快证明某个端点还活着的方式。
+最后这种情况正是模组对 `excl` 跑 **2 秒自检**、低于 90% 就回退 `shared` 的原因。`--shared` 在普通共享流上跑同样的测量，是最快证明某个端点还活着的方式。
 
 ### `session_tool` —— 会话静音 / 音量 / 峰值检查器
 
@@ -371,6 +374,7 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 - **影片音频（stream2）** 在 `asio`/`shared` 模式下仍走真实 WASAPI 流。`excl` 模式下设备被独占，stream2 初始化失败（`AUDCLNT_E_DEVICE_IN_USE`）、过场音静音——这对游玩无影响、符合预期。
 - **共享模式无法低于引擎缓冲**（多数驱动约 22 ms）。那是平台地板，与本模组无关。
 - `shared`/`excl` 只使用默认渲染端点。
+- **不再有无谓的 ASIO 回退：** `asio` 后端不再在切歌/流切换时无谓地回退到 `shared`（v13.9 通过欠载宽限窗口 + 生产者空闲守卫修复）；环形缓冲丢弃与消费线程竞争仍是已记录、未改变的限制。
 
 ---
 

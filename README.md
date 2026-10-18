@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.7-informational)
+![Version](https://img.shields.io/badge/version-v13.9-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -66,7 +66,7 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 |---|---|
 | `asio` *(default)* | Native ASIO driver. Lowest, most consistent result on the test hardware. |
 | `shared` | Our own WASAPI shared-mode stream. Works on **any** device, no ASIO driver required. |
-| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (after skipping the ~70 ms clock ramp-up): if the device delivers less than 95 % of real time, the backend is torn down and the mod falls back to `shared`. |
+| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (after skipping the ~70 ms clock ramp-up): if the device delivers less than 90 % of real time, the backend is torn down and the mod falls back to `shared`. |
 
 With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
 registry order and keeps the first one that fully initialises — the log shows each attempt
@@ -89,7 +89,7 @@ No code bytes are written. The game's own **COM implementation** is replaced (ou
 
 - **All-or-nothing vtable patches.** Both the client takeover (9 slots) and the render-client tap (2 slots) are installed as a set; if any slot cannot be patched, the ones already written are rolled back. A half-patched table used to leave `slot 3 = our hook` while the "patched" flag stayed 0, so the next attempt hooked our own function onto itself (stack overflow).
 - **Staged fallback with real verification:** `output = excl` → `shared` → ASIO. Each stage now *waits* for its thread to report success, so a failed `Start()` no longer looks like a working backend.
-- **Exclusive self-test** (skips the ~70 ms clock ramp-up, then measures 2 s) checks both delivered frames and the **device clock** (`IAudioClock`); below 95 % of real time it tears the stream down and falls back.
+- **Exclusive self-test** (skips the ~70 ms clock ramp-up, then measures 2 s) checks both delivered frames and the **device clock** (`IAudioClock`); below 90 % of real time it tears the stream down and falls back.
 - **Fake mode has a real fallback:** if ASIO dies while the client is faked, the mod starts the shared backend (`WoStart(0)`) instead of the old "game audio returns via WASAPI", which was impossible with no real stream.
 - **No engine handoff in fake mode:** the tap-and-zero dance (resync + 23 ms wait) is skipped, so starting a song no longer discards ~10 ms of already mixed audio.
 - **Ring memory is allocated unconditionally** and every ring access is NULL-guarded, so `fake_client = 1` + `asio = 0` (previously a guaranteed crash) now works and is auto-corrected to `output = shared`.
@@ -147,7 +147,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.7` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.9` and `MODE: v13 takeover`.
 
 ---
 
@@ -174,6 +174,7 @@ mute_mode   = 1
 | `block` | `64` | ASIO block size (16…1024). |
 | `handoff_ms` | `0` | Handoff delay; `0` = auto. |
 | `mute_mode` | `1` | `1` = tap-and-zero handoff; `0` = legacy `SetMute`. |
+| `excl_period_ms` | `0` | Exclusive backend event period in ms; `0` = device default (10 ms); only `0` works — see the `excl` section. |
 
 ---
 
@@ -204,7 +205,7 @@ devices are genuinely unusable: one onboard codec initialises but keeps its devi
 at **~0.3 %**.
 
 So v13 measures the device clock at startup and rolls back to `shared` when the rate is
-under 95 % — which is what exclusive usually does in practice, and why it is not the
+under 90 % — which is what exclusive usually does in practice, and why it is not the
 default and not recommended. The self-test fills silence to keep the clock moving before
 the game starts mixing, skips the ~70 ms clock ramp-up, and measures over 2 s. After a
 genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the
@@ -215,6 +216,8 @@ restart. Use `tools/excl_rate_probe.exe` to check your own device:
 excl_rate_probe --list
 excl_rate_probe "Speakers" --seconds 2
 ```
+
+The exclusive backend always runs at the device's default period (10 ms). The config key `excl_period_ms` can override the period, but **any** value above the device default makes the device stop firing its event callbacks — the stream is invalidated and the backend falls back to `shared` — so in practice only `0` (the device default) works. Because a 10 ms buffer has no slack, exclusive keeps a small residual risk and remains not recommended (`asio` is the recommended backend).
 
 ---
 
@@ -373,7 +376,7 @@ How to read the summary:
   exclusive cannot be used on that device.
 
 That last case is exactly why the mod runs a **2 s self-test** on `excl` and rolls
-back to `shared` below 95 %. `--shared` runs the same measurement on a normal shared
+back to `shared` below 90 %. `--shared` runs the same measurement on a normal shared
 stream, which is the quickest way to prove an endpoint is alive at all.
 
 ### `session_tool` — session mute / volume / peak inspector
@@ -430,6 +433,7 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.
+- **No more spurious ASIO rollback:** the `asio` backend no longer rolls back to `shared` at song/stream transitions (fixed in v13.9 by an underrun grace window plus a producer-idle guard); the ring discard still racing the consumer thread remains a documented, unchanged limitation.
 
 ---
 

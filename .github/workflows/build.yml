@@ -53,4 +53,7 @@ jobs:
             src/asio_list.exe
             src/excl_rate_probe.exe
             src/session_tool.exe
-          generate_release_notes: true
+          # No auto-generated body: the release notes are curated in CHANGELOG.md and
+          # written onto the release itself, so this step must only attach the binaries.
+          # (softprops only touches the body when body / body_path / generate_release_notes
+          #  is given - omitting all three leaves the curated notes in place.)

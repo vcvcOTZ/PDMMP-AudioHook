@@ -3,8 +3,88 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.8`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.9`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.9] — 2026-10-18
+
+Makes the recommended `asio` backend survive song / stream transitions, and settles the
+`excl` line for good. `shared` and `excl` stay available; the default output is still
+`asio`.
+
+### Fixed — `asio` rolled back to `shared` at every stream transition
+
+`AsioFill` counted an empty ring as an underrun whenever the fake driver was running. The
+game pauses its producer for a moment around a stream transition, and discards the ring
+via `Fake_Stop` / `Fake_Reset`, so the ring was legitimately empty for a second or two -
+the counter flooded past the monitor's `runaway underruns` bar (2 consecutive seconds with
+> 100 underruns/s) and dropped ASIO mid-song. Field data (12:32 / 14:19 / 14:31) showed
+the ASIO callback itself healthy (`und=0` for 60 s) right up to the transition:
+
+- The count is now suppressed for `ASIO_UND_GRACE_MS` (3 s) after any fake-driver
+  start / stop / reset.
+- …and while the producer has written nothing for `ASIO_PRODUCER_IDLE_MS` (1 s): an **idle
+  producer is not a fault** - only an empty ring with a *busy* producer is a real underrun.
+  A real ASIO stall lasts far longer than either guard and is still caught (stalled
+  callbacks and ring drops are checked separately).
+- `Fake_Reset` stamps the grace too, because a seek / restart discards the ring without a
+  preceding `Stop` - the one gap the v13.8 Start/Stop stamps left open.
+- Verified: a 6 m 43 s `asio` run (block 64, 4.1 ms) held `und=0` end to end, including the
+  `[fake] Stop()` at the end.
+
+### Added
+
+- `excl_period_ms` (config): the exclusive backend's event period in ms, `0` = the device
+  default (10 ms). See the note below - only `0` is usable in practice.
+
+### Changed — the `excl` self-test is 2 s again, with a 90 % gate
+
+v13.8's 5 s window bought nothing (the reading does not converge with window length) and
+delayed the first audio by 3 s, so the title screen came up silent for that whole stretch.
+The window is **2 s** again, and the rollback bar is **90 %** (was 95 %): on a healthy
+device the reading is a self-test-phase transient that lands in a 93.5–98.5 % band, and
+every session that cleared the old bar then ran stably, while the only genuinely broken
+sessions read 0 %.
+
+### Documented — `excl` is capped at the device's default period
+
+Setting `excl_period_ms` above the device default makes the device stop firing events and
+the stream is invalidated, so it falls back to `shared`. 10 ms is the only value that
+works, and that leaves the exclusive buffer with no slack - the backend keeps a small
+residual risk and stays non-recommended. `asio` is the recommended path.
+
+### Fixed — `shared` under-used the ring on endpoints above 44.1 kHz
+
+`WoThread` converted the ring's capacity from source frames (44.1 kHz) to output frames
+(device rate) only when `g_rsStep > 1.0`. A 48 / 96 kHz endpoint has `step < 1`, so it used
+just `1/step` (94 % at 48 kHz) of what the ring could supply every period and padded the
+rest with silence. The conversion now runs in both directions.
+
+### Fixed — resampler extrapolation on starvation
+
+`RsPull` could leave `g_rsFrac >= 1.0` when `RsNext` came back empty, so the next call
+extrapolated past `g_rsNext` (an audible click) instead of interpolating. The fraction is
+normalised before the starvation break.
+
+### Docs
+
+- README / README.zh-CN: version badge, boot-banner string, the `excl` section (period
+  cap, 2 s self-test, 90 % gate) and the `excl_period_ms` config key. `config.toml` →
+  0.3.9.
+
+### Build
+
+`/W3` and `/W4`: zero warnings (DLL and all three tools).
+
+### Deferred (documented, not changed)
+
+- The ring discard (`RingResyncToLatest`) still writes `g_rr` from the game's stream
+  thread while a backend may be reading; it is only ever reached from the game's own
+  serialised stream calls, so it is left as-is.
+- `FakeInit` failure still clears the global fake flags, and the fake driver's idle drain
+  can overlap a just-started backend for one tick.
 
 ---
 

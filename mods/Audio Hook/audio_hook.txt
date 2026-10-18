@@ -13,6 +13,8 @@
 # block       : ASIO 块大小 16..1024（64 = 1.45ms）
 # handoff_ms  : 0 = 自动；>0 = 手动覆盖
 # mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
+# excl_period_ms : 仅 output=excl 生效：独占周期(ms)。0 = 设备默认(10)
+#                 放宽(如 20/30)给事件循环更多前瞻，对抗游戏内负载导致的交付不足；延迟随之增加
 # 急救：同目录放空文件 audio_hook.off
 
 fake_client = 1
@@ -22,3 +24,4 @@ asio_driver = *
 block       = 64
 handoff_ms  = 0
 mute_mode   = 1
+excl_period_ms = 0

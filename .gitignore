@@ -10,5 +10,6 @@ audio_hook.off
 *.ilk
 *.pdb
 *.exe
+/src/*.dll
 hook_obj/
 probe_obj/
