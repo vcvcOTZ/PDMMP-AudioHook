@@ -3,8 +3,74 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.0`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.3`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.3] — 2026-10-18
+
+Generic defaults for distribution, plus the items `AUDIT-v13.1.md` left open.
+
+### Changed — `asio_driver` defaults to auto, and auto really probes every driver
+
+The shipped config used to name the author's own interface, which is wrong on every other
+machine. It is now `*`, and `*` means "first **usable** driver": the old code stopped at
+the first driver whose COM server answered, so a machine with several registered drivers
+could end up on a disconnected interface, a virtual device, or one that cannot run at
+44.1 kHz — and then sit in "prepare failed" while a perfectly good driver was never tried.
+Each candidate now goes through init → channels → buffer size → sample rate →
+createBuffers → channel format; a failure releases it and moves on. Capped at 8 attempts
+(three dead drivers cost ~18 ms). The log names every attempt and the winner.
+
+`asio_driver` also accepts a quoted value (`"*"`) and the keyword `auto`.
+
+### Fixed — remaining `AUDIT-v13.1.md` findings
+
+- **N6 (P1)** — `output = shared` never recovered from a dead endpoint: a failing
+  `GetCurrentPadding` just looped on `Sleep(2)` forever, with no log line and the state
+  stuck at "running". The usual cause is Windows switching the default device when
+  headphones are plugged/unplugged. The writer now bails out and marks the backend failed;
+  a watchdog rebuilds the shared stream (3 s backoff, 5 attempts) and logs every attempt.
+- **N22** — `Int16MSB` / `Int24MSB` / `Int32MSB*` / `Float32MSB` / `Float64*` passed the
+  "unsupported format" gate but had no writer, so the mod announced a healthy format and
+  played silence. Preparation now checks an `IsTypeRenderable()` whitelist instead.
+- **N2/N21** — the staging buffer was sized from the first block and never resized; a retry
+  that got a larger block overflowed it.
+- **N25** — `Stop()` / `Reset()` flushed the ring but not the resampler's own 441 frames,
+  so a seek could replay a fragment of the previous song. (`RsReset()` would also have
+  reset the step and broken non-44.1 kHz endpoints) → new `RsFlush()`.
+- **N11** — `timeBeginPeriod(1)` is paired with `timeEndPeriod(1)` at detach and skipped
+  when `audio_hook.off` disables the mod.
+- **N12** — a truncated log line was dropped whole (`_snprintf_s` returns -1); it now
+  writes what fits.
+- **N9** — documented that the fake `GetCurrentPadding` counts source frames.
+- **N26** — the watchdog really retries now (see N6).
+
+### Removed
+
+- `exclusive2` no longer appears in the shipped `audio_hook.txt`. The key is still
+  tolerated (logged once, then ignored) so old configs keep working.
+
+### Docs
+
+- Every remaining machine-specific detail (interface model, test-host wording) was replaced
+  with generic text; examples use placeholder driver/device names.
+- Config examples and the generated `audio_hook.txt` are brand-neutral.
+
+### Still deferred
+
+- **P2-4** the exclusive self-test still runs synchronously (~600 ms) on the game's init
+  thread; **P3-4** `CoInitializeEx` is not paired on worker threads; **P3-5** the
+  endpoint-notification callback is not unregistered; **P4-13** device names still use
+  `CP_ACP`; **P4-14** the detach report is still written from `DllMain`; **P5-6** the
+  single-file layout is unchanged.
+- **N17** (worst-case start-up blocking) and **N18** (apartment mixing) — documented, no
+  code change: both are design-level and the current behaviour is verified working.
+
+### Build
+
+`/W3` and `/W4`: zero warnings.
 
 ---
 
@@ -38,8 +104,8 @@ reports `music/total = 72.6 %` (and `50.0 %` at 22.05 kHz) against the old formu
 bytes are bits 0-23 of that word, i.e. **bits 16-31 of the shifted value** — only
 the sample's low byte survived: values below 256 became silence, 16384 became 0,
 32767 wrapped to a tiny value. It is `<< 8` (the `asio_list` copy always had it
-right). Focusrite reports `ASIOSTInt32LSB` (type 18), which is why neither audit
-run heard it; a driver reporting type 17 would have been silent.
+right). The interface used for testing reports `ASIOSTInt32LSB` (type 18), which is why
+neither audit run heard it; a driver reporting type 17 would have been silent.
 
 ### Fixed — smaller accuracy issues in the same file
 
@@ -55,7 +121,7 @@ run heard it; a driver reporting type 17 would have been silent.
 **`asio_list`**
 - A `--test NAME` that matches nothing used to fall back to the **first** driver — so you
   could "verify" the wrong device. It is now an error (exit 2) that lists the real names.
-- Case-insensitive matching (`focusrite usb` works); `--test` without a value and unknown
+- Case-insensitive matching (`usb asio` works); `--test` without a value and unknown
   arguments are usage errors instead of being ignored.
 - Cleanup now runs `stop` → `disposeBuffers` → `Release` on every path. The old build
   never freed the buffers, so testing driver after driver could leave the previous one
@@ -72,7 +138,7 @@ run heard it; a driver reporting type 17 would have been silent.
 - Exit codes: 0 ok · 1 no drivers · 2 failed/no match · 3 usage · 4 driver crashed.
 
 **`excl_rate_probe`**
-- **Device clocks do not tick in samples.** A shared-mode stream on this machine reports
+- **Device clocks do not tick in samples.** A shared-mode stream was measured reporting
   **352 800 units/s** (8 × 44.1 kHz), so the old `clock ÷ nominal` math printed a healthy
   endpoint as **784 %**. The percentage is now `clock delta ÷ GetFrequency()`, and the raw
   unit rate is printed for auditability.
@@ -275,7 +341,7 @@ The release that removes the engine buffer from the audio path.
   there is no real stream left to hand off from.
 - README restructured around the three backends.
 
-### Measured (Focusrite Scarlett Solo 3rd Gen, 44.1 kHz)
+### Measured (USB ASIO interface, 44.1 kHz)
 
 | Component | Value |
 |---|---|
@@ -285,8 +351,8 @@ The release that removes the engine buffer from the audio path.
 | WASAPI shared engine buffer | 970 frames = **22.0 ms** |
 
 Steady state over 25 s runs: **44,100 frames/s, 0 underruns, 0 dropped frames** on both
-`asio` and `shared`. Exclusive: Focusrite **88.5 %**, Realtek onboard **0.3 %** of real
-time → both roll back automatically.
+`asio` and `shared`. Exclusive: a USB interface **88.5 %**, an onboard codec **0.3 %** of
+real time → both roll back automatically.
 
 ---
 
@@ -299,7 +365,7 @@ time → both roll back automatically.
 
 ### Removed
 
-- **Abandoned.** With polling, the Focusrite driver only grants **1768 frames (40 ms)**
+- **Abandoned.** With polling, that driver only granted **1768 frames (40 ms)**
   instead of 221 frames (5 ms), which is worse than shared mode and fails CRI's own buffer
   validation → no audio, game hangs. Exclusive + event callbacks keeps 5 ms but inherits
   the ~88 % delivery rate, which cannot be fixed in software.
@@ -321,8 +387,8 @@ time → both roll back automatically.
   made start-up underruns worse. Callbacks now only bump atomic counters, reported once
   per second by the monitor thread.
 - `asio_list`: silence was written with a fixed 4-byte frame size, so 16-bit drivers
-  (Realtek) had twice their buffer overwritten → heap corruption and a crash after
-  playback. Frame size is now derived from the stream's sample format.
+  (many onboard codecs) had twice their buffer overwritten → heap corruption and a crash
+  after playback. Frame size is now derived from the stream's sample format.
 - `asio_list`: block size clamped to the driver's min/max/granularity; `outputReady()` is
   only called when the driver supports it.
 
@@ -403,7 +469,7 @@ Full details, sample output and how to read the numbers are in the
 ```bat
 asio_list                          :: interactive: Up/Down, Enter = 3 s tone, Q = quit
 asio_list --list                   :: plain list
-asio_list --test "Focusrite USB"   :: play on that driver directly
+asio_list --test "USB ASIO"        :: play on that driver directly
 ```
 
 Copy the **full** driver name it prints into `asio_driver`. Matching is a substring search
@@ -413,7 +479,7 @@ that takes the first hit, so a short string can select a different driver.
 
 ```bat
 excl_rate_probe --list
-excl_rate_probe "Realtek" --seconds 2
+excl_rate_probe "Speakers" --seconds 2
 excl_rate_probe default --shared
 ```
 

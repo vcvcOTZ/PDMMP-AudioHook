@@ -2,23 +2,23 @@
 #
 # fake_client : 1 = 接管 CRI 的 stream1 客户端（去掉游戏自带的 22ms 缓冲）
 #               ★ 低延迟的核心开关，必须为 1 才能用 output 后端
-# output      : asio   = ASIO 直通（推荐，本机最快，软件链路 ≈10ms）
+# output      : asio   = ASIO 直通（推荐，延迟最低，软件链路 ≈10ms）
 #               shared = WASAPI 共享（没有 ASIO 驱动时用；受引擎 22ms 缓冲限制）
-#               excl   = WASAPI 独占（启动自检 600ms，实测速率 <95% 会自动回退到 shared）
-#                        ★ Focusrite 本机只有 88.5%，会自动降级；换好驱动机器才用得上
+#               excl   = WASAPI 独占（启动自检 600ms，实测速率 <95% 会自动回退到 shared；
+#                        部分声卡的驱动不推进硬件时钟，用之前先跑 tools\excl_rate_probe.exe）
 # asio        : output=asio 时是否启用 ASIO 后端（1 = 启用）
-# asio_driver : 填 asio_list 里显示的完整驱动名最精确；也可填名称子串；"*" = 第一个可用驱动
+# asio_driver : "*" = 自动：按注册表顺序逐个尝试，选第一个能完整初始化的驱动（默认）
+#               机器上装了多个 ASIO 驱动时，先运行 tools\asio_list.exe —— ↑↓ 选择、回车试听，
+#               哪个声卡出声就把它的完整名字填在这里（也可只填名称的一部分，子串匹配）
 # block       : ASIO 块大小 16..1024（64 = 1.45ms）
 # handoff_ms  : 0 = 自动；>0 = 手动覆盖
 # mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
-# exclusive2  : 旧路线B实验（独占 + 伪 EC），已废弃，保持 0
 # 急救：同目录放空文件 audio_hook.off
 
 fake_client = 1
 output      = asio
 asio        = 1
-asio_driver = Focusrite USB ASIO
+asio_driver = *
 block       = 64
 handoff_ms  = 0
 mute_mode   = 1
-exclusive2  = 0

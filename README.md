@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.2-informational)
+![Version](https://img.shields.io/badge/version-v13.3-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Replaces the game's audio **client** (not its code) so the engine buffer disappears from the path, then renders the game's PCM through a backend of your choice: **ASIO**, **WASAPI exclusive** or **WASAPI shared**.
@@ -66,6 +66,11 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 | `shared` | Our own WASAPI shared-mode stream. Works on **any** device, no ASIO driver required. |
 | `excl` | WASAPI exclusive, 5 ms period when the driver honours it. Guarded by a **600 ms self-test**: if the device delivers less than 95 % of real time, the backend is torn down and the mod falls back to `shared`. |
 
+With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
+registry order and keeps the first one that fully initialises — the log shows each attempt
+and the driver that won, so a machine with several drivers is never silently routed to a
+disconnected or virtual device.
+
 ### 3. Anti-tamper safe
 
 Only vtable slots are patched (data layer):
@@ -86,6 +91,7 @@ No code bytes are written. The game's own **COM implementation** is replaced (ou
 - **Arbitrary channel counts** on the output side (2.0 / 5.1 / 7.1 devices), FL/FR mapped, extra channels silenced.
 - **Partial writes**: only as many frames as the ring actually holds are released, so a device whose engine buffer is larger than CRI's queue does not get zero-padded every period.
 - **Bounded waits**: the tap-steady wait times out after 30 s; the exclusive rollback waits for its writer thread to actually exit (2 s) and leaks rather than frees if it doesn't (no use-after-free).
+- **Dead output stream is rebuilt**: if the shared backend's device disappears (headphones unplugged, default device changed, stream pre-empted), the writer marks the backend failed instead of spinning in silence, and a watchdog restarts it (3 s backoff, up to 5 attempts, every attempt logged).
 - **Realtime-safe callbacks**: no file I/O and no allocation inside the ASIO/WASAPI callbacks; counters are reported by a monitor thread.
 - **Session mute cleanup** now walks the process's own audio sessions (`IAudioSessionManager2`), so it also works when stream1 is faked — it used to fail with `AUDCLNT_E_NOT_INITIALIZED` and silently do nothing.
 - **Logs**: one atomic write per line, append mode with rotation (`audio_hook.log.1`), so the run that crashed is still readable.
@@ -94,7 +100,7 @@ No code bytes are written. The game's own **COM implementation** is replaced (ou
 
 ## Measured buffer sizes
 
-Objective numbers from the test machine (Focusrite Scarlett Solo 3rd Gen, 44.1 kHz):
+Objective numbers, measured with a USB ASIO interface at 44.1 kHz:
 
 | Component | Value |
 |---|---|
@@ -102,7 +108,7 @@ Objective numbers from the test machine (Focusrite Scarlett Solo 3rd Gen, 44.1 k
 | ASIO block size | 64 frames = **1.45 ms** |
 | ASIO driver-reported latency | 181 frames in / out = **4.1 ms** |
 | WASAPI shared engine buffer | 970 frames = **22.0 ms** @44.1 kHz (1056 @48 kHz) |
-| WASAPI exclusive period (Focusrite) | 221 frames = **5.01 ms** |
+| WASAPI exclusive period (as granted by that driver) | 221 frames = **5.01 ms** |
 
 Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s delivered, 0 underruns, 0 dropped frames** over 25 s runs.
 
@@ -136,7 +142,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.2` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.3` and `MODE: v13 takeover`.
 
 ---
 
@@ -148,7 +154,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
 fake_client = 1
 output      = asio
 asio        = 1
-asio_driver = *          # or an exact name: Focusrite USB ASIO
+asio_driver = *          # "*" = auto (first usable driver); or pin a name from asio_list
 block       = 64
 handoff_ms  = 0
 mute_mode   = 1
@@ -159,7 +165,7 @@ mute_mode   = 1
 | `fake_client` | `1` | Replace CRI's stream1 client with ours. **Required** for any non-ASIO backend; without it you get the old v11 behaviour. |
 | `output` | `asio` | `asio` / `shared` / `excl`. |
 | `asio` | `1` | Enable the ASIO worker when `output = asio`. |
-| `asio_driver` | `*` | Substring match against driver names listed by `asio_list`. `"*"` = first driver. Prefer an exact name when several drivers exist. |
+| `asio_driver` | `*` | Case-insensitive substring match against the names listed by `asio_list`. `*` (or `auto`, or empty) = **first driver that actually initialises**: every registered driver is tried in turn until one reports ≥2 outputs, 44.1 kHz and a usable sample format. Pin the exact name when several drivers are installed. |
 | `block` | `64` | ASIO block size (16…1024). |
 | `handoff_ms` | `0` | Handoff delay; `0` = auto. |
 | `mute_mode` | `1` | `1` = tap-and-zero handoff; `0` = legacy `SetMute`. |
@@ -182,16 +188,16 @@ If the endpoint is **not 44.1 kHz** (48 kHz HDMI / Bluetooth / onboard is common
 
 Opens `AUDCLNT_SHAREMODE_EXCLUSIVE` with `duration == periodicity` (5 ms) and event-driven callbacks. Because exclusive mode bypasses the engine, the device must be free — and since stream1 no longer opens a real stream, it is.
 
-The catch is driver quality. On this machine:
+The catch is driver quality. Of the devices tested so far:
 
-- Focusrite USB — initializes with 221 frames, but the **device clock advances at 88.5 %** of nominal;
-- Realtek onboard — initializes with 480 frames at 48 kHz, but the **device clock stays at ~0.3 %**.
+- one USB interface — initialises with 221 frames, but the **device clock advances at 88.5 %** of nominal;
+- one onboard codec — initialises with 480 frames at 48 kHz, but the **device clock stays at ~0.3 %**.
 
 Both would starve the queue and make the music stutter, so v13 measures 600 ms at startup and rolls back to `shared` when the rate is under 95 %. Use `tools/excl_rate_probe.exe` to check your own device:
 
 ```
 excl_rate_probe --list
-excl_rate_probe Realtek --seconds 2
+excl_rate_probe "Speakers" --seconds 2
 ```
 
 ---
@@ -237,7 +243,7 @@ Logs: `audio_hook.log` (main), `audio_hook_detach.log` (detach diagnostics).
 ## Portability
 
 - **Any device, no ASIO driver:** `fake_client = 1`, `output = shared`.
-- **ASIO interface:** `fake_client = 1`, `output = asio`, and set `asio_driver` to the name reported by `asio_list`. The interface must run at 44.1 kHz; otherwise the bridge refuses and falls back.
+- **ASIO interface:** `fake_client = 1`, `output = asio`, and leave `asio_driver = *` (auto) or pin the name reported by `asio_list`. The interface must run at 44.1 kHz; otherwise the bridge refuses and falls back.
 - **Exclusive experiment:** `output = excl` — run `excl_rate_probe` first; if the device does not report ≈100 %, the mod will fall back anyway.
 - Multi-channel outputs (5.1/7.1) are handled: FL/FR are mapped, remaining channels are silenced.
 
@@ -261,7 +267,7 @@ run while the game is playing unless noted.
 ```
 asio_list                          interactive menu (arrow keys)
 asio_list --list                   plain text list, no menu
-asio_list --test "Focusrite USB"   play the tone on that driver directly
+asio_list --test "USB ASIO"        play the tone on that driver directly
 asio_list --test "*"               play on the first registered driver
 asio_list --help
 ```
@@ -274,31 +280,29 @@ The interactive menu lists every driver registered under
 tone on it, any key stops, **Q** quits.
 
 ```
-=== ASIO Driver Test  (9 drivers) ===
+=== ASIO Driver Test  (5 drivers) ===
   Up/Down: select   Enter: play 3 s tone   Q: quit
 
-  [ 1] Ableton Move
-  [ 2] Ableton Push
-  [ 3] Focusrite Thunderbolt ASIO
-  [ 4] Focusrite USB ASIO          <- highlighted = selected
-  [ 5] GT-1000
-  ...
+  [ 1] USB Audio ASIO Driver
+  [ 2] Thunderbolt Audio ASIO
+  [ 3] Onboard ASIO
+  [ 4] Virtual Mixer ASIO       <- highlighted = selected
+  [ 5] Guitar Multi-Effects ASIO
 ```
-
 The tone is deliberately gentle: `0.12` amplitude with a 120 ms fade-in, so it will not
 blast your monitors. **Whichever speaker/headphone the tone comes out of is the physical
 output that driver drives** — that is the whole point of the tool.
 
 Use the printed name in `asio_driver`. Matching is a **case-insensitive substring**
 search that takes the **first** hit, so a short string can select the wrong driver (on a
-machine with both `Focusrite Thunderbolt ASIO` and `Focusrite USB ASIO`, writing
-`Focusrite` picks Thunderbolt). Always copy the full name.
+machine that registers both `Thunderbolt Audio ASIO` and `USB Audio ASIO`, writing
+`Audio` picks the first one). Always copy the full name.
 
 A name that matches **nothing is an error** (`exit 2`, the registered names are printed):
 it is never silently redirected to the first driver, which used to let you "verify" the
 wrong device.
 
-Drivers that crash while **loading or initialising** (some Ableton builds do) are caught
+Drivers that crash while **loading or initialising** (it happens) are caught
 with SEH and reported as `driver crashed`, so one bad driver does not stop you from testing
 the rest. Each test closes its stream (`stop` → `disposeBuffers` → `Release`) and waits for
 the audio callback to leave before freeing the buffers, so the next driver really gets the
@@ -326,7 +330,7 @@ worked) · `1` device/COM error · `2` bad command line.
    initialized: buffer 441 fr (10.00 ms) - measuring...
    -> written 43773 fr/s, device clock 43950 fr/s
 
-== SUMMARY 'Focusrite USB Audio'
+== SUMMARY 'Speakers (USB Audio)'
    best: 44100 Hz / 16 bit / 2 ch  buffer 441 fr  ->  99.7% of real time
 ```
 
@@ -339,8 +343,8 @@ worked) · `1` device/COM error · `2` bad command line.
 | `Initialize 0x88890019` | buffer size not aligned — that candidate is skipped |
 | `(clock not advancing)` | the clock object exists but its position never moved — scored 0 % |
 
-> Device clocks do **not** count in samples at the nominal rate: a shared-mode stream on
-> the test machine reports **352800 units/s** (8× 44.1 kHz). The tool divides by
+> Device clocks do **not** count in samples at the nominal rate: a shared-mode stream was
+> measured reporting **352800 units/s** (8× 44.1 kHz). The tool divides by
 > `GetFrequency()` before turning the number into a percentage, so 100 % really means
 > real time. If a driver has no usable `IAudioClock`, the written rate is used instead and
 > the line says so.
@@ -373,7 +377,7 @@ appended next to the exe (`session_tool_report.txt`, rotated to
 UTF-8, so Chinese/Japanese names are readable and still matchable.
 
 ```
-== device '扬声器 (4- Focusrite USB Audio)' [{...}]
+== device 'Speakers (USB Audio)' [{...}]
     session pid=16672  DivaMegaMix.exe   [Active] muted=no volume=1.00 peak=0.4182
     session pid=13564  msedge.exe        [Inactive] muted=no volume=1.00 peak=0.0000
 ```
@@ -405,7 +409,7 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 
 ## Known limitations
 
-- **WASAPI exclusive is driver-dependent.** Measured on the test machine: Focusrite USB **88.5 %**, Realtek onboard **0.3 %** of real time. The backend therefore self-tests and falls back; it is not the default and not a recommended path.
+- **WASAPI exclusive is driver-dependent.** Measured so far: a USB interface at **88.5 %**, an onboard codec at **0.3 %** of real time. The backend therefore self-tests and falls back; it is not the default and not a recommended path.
 - **The exclusive self-test runs on the game's init thread**, so `output = excl` adds ~600 ms to the first audio initialisation (and claims the device before stream2 exists). Acceptable for an experiment; not used by default.
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
@@ -422,13 +426,14 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
   - `asio`（默认，推荐）：原生 ASIO 驱动，block 64 = 1.45 ms，驱动报告 4.1 ms。
   - `shared`：自己开一条 WASAPI 共享流，**不需要 ASIO 驱动**，任何设备可用；引擎 22 ms 缓冲是平台地板。
   - `excl`：WASAPI 独占（5 ms 周期），带 **600 ms 启动自检**，设备跑不满 95% 就自动回退到 shared。
-- **实测**（本机 Focusrite）：CRI 缓冲区 441 帧 = 10 ms；ASIO 64 帧 = 1.45 ms；共享引擎 970 帧 = 22 ms。稳态 44,100 帧/秒、0 欠载。
-- **独占实测结论**：Focusrite 设备时钟只有 88.5%、板载 Realtek 只有 0.3% —— 驱动接受独占流但不真正跑，所以**独占不适合当主推**，本模组会自动降级。
+- **默认驱动**：`asio_driver = *` 表示自动 —— 按注册表顺序逐个尝试，选第一个能完整初始化的驱动（日志会写明每次尝试和最终选中的那个）。机器上装了多个 ASIO 驱动时，建议用 `asio_list` 试听后把完整名字填进去。
+- **实测**（44.1 kHz 设备）：CRI 缓冲区 441 帧 = 10 ms；ASIO 64 帧 = 1.45 ms；共享引擎 970 帧 = 22 ms。稳态 44,100 帧/秒、0 欠载。
+- **独占实测结论**：试过的 USB 声卡设备时钟只有 88.5%、板载 codec 只有 0.3% —— 驱动接受独占流但不真正跑，所以**独占不适合当主推**，本模组会自动降级。
 - **安装**：`Audio Hook` 文件夹放进 `mods/`，根 `config.toml` 的 `priority` 加 `"Audio Hook"`。
 - **急救**：同目录放空文件 `audio_hook.off`；或 `fake_client = 0` + `asio = 0` 回到旧的纯 WASAPI 优化。
 - **配套工具**（`tools/`，也可从 Release 下载）：
   - `asio_list` —— 列出本机所有 ASIO 驱动，↑↓ 选择、回车播放 3 秒测试音，**哪个声卡出声就是它**；`--list` 纯列表、`--test "名字"` 直接试听。填进 `asio_driver` 的就是它显示的名字（要用完整名，子串匹配取第一个）。
-  - `excl_rate_probe` —— 测某设备的独占/共享流**是否真的实时**：`excl_rate_probe --list`、`excl_rate_probe Realtek --seconds 2`、`excl_rate_probe default --shared`。看 `device clock` 的百分比：≥95% 可用、90~95% 勉强、<50% 驱动根本没启动硬件。
+  - `excl_rate_probe` —— 测某设备的独占/共享流**是否真的实时**：`excl_rate_probe --list`、`excl_rate_probe "Speakers" --seconds 2`、`excl_rate_probe default --shared`。看 `device clock` 的百分比：≥95% 可用、90~95% 勉强、<50% 驱动根本没启动硬件。
   - `session_tool` —— 会话诊断：不带参数列出各设备所有音频会话（状态/静音/音量/峰值）；`--unmute DivaMegaMix` 清除旧版遗留的持久静音（需游戏运行中执行）。
 - **更新日志**：见 [CHANGELOG.md](CHANGELOG.md)。
 

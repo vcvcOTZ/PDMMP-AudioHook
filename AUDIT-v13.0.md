@@ -188,7 +188,7 @@
 
 - 位置：1440-1450（改 `shareMode/flags`）、849-866（`PseudoECThread`）、834-844（`Hook_SetEventHandle`）、181-182 状态变量
 - 问题：
-  1. CHANGELOG 12.0 已给出实测结论——"轮询模式下 Focusrite 只给 1768 帧(40 ms)，比 shared 还差，CRI 自己的 buffer 校验不过 → 没声音 + 游戏卡住"。这段代码原样保留在 13.0 里。
+  1. CHANGELOG 12.0 已给出实测结论——"轮询模式下该驱动只给 1768 帧(40 ms)，比 shared 还差，CRI 自己的 buffer 校验不过 → 没声音 + 游戏卡住"。这段代码原样保留在 13.0 里。
   2. 更糟的是它现在**必然走不通**：去掉了 `EVENTCALLBACK` 却仍让 CRI 调 `SetEventHandle`，真实 WASAPI 会拒绝 → `g_s1Event` 恒为 NULL → `PseudoECThread` 里 `if (!c || !g_s1Event ...) { Sleep(5); continue; }` 变成永不退出的休眠循环（`g_pseudoEC` 也永不复位）。
   3. 若真进了这个分支，`PseudoECThread` 的 `if/else` 两支都是 `Sleep(0)` → 100% 占满一个核。
 - 矛盾点：文件头注释（第 21-22 行）还写着 *"v11.2: EXCLUSIVE-mode experiment code fully removed"*，而代码就在 850 行之后。
@@ -319,7 +319,7 @@
 
 1. **验证 P0-1**：`audio_hook.txt` 改成 `fake_client = 1` / `output = shared` / `asio = 0` → 启动游戏。预期：进游戏后第一次出声瞬间崩溃（AV on write at NULL）。若真崩，说明这条是 P0 无疑。
 2. **验证 P1-2**：Windows 声音设置里把默认输出设备格式切成 **48 kHz / 24 bit**，配置改回 `fake_client=1` / `output=shared` / `asio=1` → 播一首熟悉的歌。预期：整体速度和音高都偏高（约 +8.8%，接近一个半音）。
-3. **验证 P0-3**：`asio_driver = NoSuchDriver`，`output=asio` → 启动游戏并观察日志出现 `[asio] CoCreateInstance ... hr=0x80040154`。预期：游戏无声（回退应该走到 WoStart(0)，但那需要 fake_client=1），随后用任意 DAW 打开 Focusrite ASIO，看是否报"设备已被占用"。
+3. **验证 P0-3**：`asio_driver = NoSuchDriver`，`output=asio` → 启动游戏并观察日志出现 `[asio] CoCreateInstance ... hr=0x80040154`。预期：游戏无声（回退应该走到 WoStart(0)，但那需要 fake_client=1），随后用任意 DAW 打开该 ASIO 驱动，看是否报"设备已被占用"。
 
 ## 附录 B：修复优先级建议
 

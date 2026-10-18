@@ -16,7 +16,7 @@
 
 **没有 P0。** 有一个 P1，落在 `asio_list`：回调线程与 `disposeBuffers()` 之间没有在飞保护——这正是 `audio_hook.cpp` 里已经用 `g_asioBusy` 修过的同一类问题（那边的 P1-9），这个工具没同步。而 README 第 302 行恰好写着"one bad driver cannot take down the tool"。
 
-**另有一个跨文件发现（比这三份里的任何单条都重要）**：`audio_hook.cpp` 的 `ASIOSTInt24LSB` 写出是**错的**，而 `asio_list.cpp` 里同一件事是对的。两份审计（v13.0 / v13.1）都漏了这条，因为作者本机 Focusrite 报告的是 `type=18`（`ASIOSTInt32LSB`），那条分支从未跑过。详见第 4 节。
+**另有一个跨文件发现（比这三份里的任何单条都重要）**：`audio_hook.cpp` 的 `ASIOSTInt24LSB` 写出是**错的**，而 `asio_list.cpp` 里同一件事是对的。两份审计（v13.0 / v13.1）都漏了这条，因为测试用声卡报告的是 `type=18`（`ASIOSTInt32LSB`），那条分支从未跑过。详见第 4 节。
 
 统计：**P1×1、P2×11、P3×12**（含跨文件 1 条）。
 
@@ -92,7 +92,7 @@
 
 ### AL-2（P2）`asio->Release()` 在 `__try` 之外
 
-- 335 行。`stop()` / `disposeBuffers()` 都被 SEH 包住了，最可能崩的 `Release()` 反而没有。对已经出过问题的驱动（Ableton 那几个），Release 里做析构+卸载 DLL，最容易二次崩。
+- 335 行。`stop()` / `disposeBuffers()` 都被 SEH 包住了，最可能崩的 `Release()` 反而没有。对已经出过问题的驱动（实测有几个 DAW 附带的驱动），Release 里做析构+卸载 DLL，最容易二次崩。
 - 修复：把 `Release()` 挪进同一个 `__try`。
 
 ### AL-3（P2）`outputReady()` 在 `createBuffers()` 之前试探

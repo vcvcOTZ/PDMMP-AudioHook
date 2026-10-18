@@ -8,7 +8,7 @@
  * Usage:
  *   asio_list                          interactive menu (Up/Down, Enter, Q)
  *   asio_list --list                   plain text list, no menu
- *   asio_list --test "Focusrite USB"   play the 3 s tone on that driver
+ *   asio_list --test "USB ASIO"        play the 3 s tone on that driver
  *   asio_list --test "*"               play on the first registered driver
  *   asio_list --help
  *

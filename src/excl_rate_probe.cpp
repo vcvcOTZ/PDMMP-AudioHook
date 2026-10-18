@@ -2,7 +2,7 @@
  * excl_rate_probe.cpp -- how fast does a WASAPI stream really run on a device?
  *
  * Key lesson: Initialize() succeeding means nothing. A driver can hand you a
- * 5 ms buffer and then never advance the hardware clock (Focusrite USB: ~88%
+ * 5 ms buffer and then never advance the hardware clock (a USB interface: ~88%
  * of real time; some Realtek configs: 0%). So this tool tries every plausible
  * exclusive format and only reports success if the clock really moves.
  *

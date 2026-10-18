@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.2 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.3 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -64,15 +64,17 @@ static int g_asioEn     = 1;    /* 1 = ASIO backend available            */
 static int g_asioBlock  = 64;   /* ASIO block size (16..1024 step 16)     */
 static int g_muteMode   = 1;    /* 1 = tap-and-zero (v11), 0 = SetMute    */
 static int g_handoffMs  = 0;    /* 0 = auto (measured buffer + 2ms)       */
-static char g_asioMatch[96] = "*";               /* "" or "*" = any driver */
+static char g_asioMatch[96] = "*";               /* "", "*" or "auto" = probe every driver */
 static int  g_fakeClient = 1;    /* 1 = own CRI's stream1 client (no engine buffer) */
 static int  g_outMode = 0;       /* 0 = ASIO, 1 = WASAPI exclusive, 2 = WASAPI shared */
 static volatile LONG g_woState = 0;   /* 0=off 2=starting 3=running 4=failed */
 static volatile LONG g_woReading = 0; /* WoThread is actively consuming the ring */
+static volatile LONG g_woFault = 0;   /* WoThread hit a dead device and bailed out */
 static volatile LONG g_woUnder = 0;
 static volatile LONG g_woCbs   = 0;
 static volatile LONG64 g_woOut = 0;   /* frames handed to the output stream */
 static volatile LONG g_fakeGbFail = 0;   /* CRI GetBuffer() rejected (queue full) */
+static volatile LONG g_timerPeriod = 0;  /* timeBeginPeriod(1) is in effect */
 
 static volatile LONG g_initCalls = 0;
 static volatile LONG g_rcCalls   = 0;
@@ -113,6 +115,7 @@ static void Log(const char* fmt, ...)
     int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02u:%02u:%02u.%03u] %s\n",
                         (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
                         (unsigned)st.wMilliseconds, body);
+    if (n < 0) n = (int)strlen(line);   /* truncated body: _snprintf_s returns -1 */
     if (n > 0) fwrite(line, 1, (size_t)n, g_log);
     fflush(g_log);
 }
@@ -361,13 +364,14 @@ static ASIOChannelInfo g_aci[2];
 static long           g_ablock = 0;
 static int            g_apostOut = 0;
 static short*         g_tmp = NULL;      /* block*2 shorts staging (interleaved) */
+static long           g_tmpBlock = 0;    /* block size g_tmp was sized for */
 
 /*  v11 FIX: src is INTERLEAVED stereo (L0,R0,L1,R1,...). Each ASIO channel
  *  must take src[i*2 + ch], not src[i]. The v10 code copied the interleaved
  *  stream straight into each channel: every 32 frames got stretched into 64
  *  samples (one octave down + half the content dropped) = the reported
  *  "shredded + pitch down" audio.  */
-/* bytes per sample for the ASIO formats we can render (0 = unsupported) */
+/* bytes per sample for the ASIO formats we know about (0 = unsupported) */
 static int AsioTypeBytes(long t)
 {
     switch (t)
@@ -383,6 +387,25 @@ static int AsioTypeBytes(long t)
     case ASIOSTFloat64LSB: case ASIOSTFloat64MSB:
         return 8;
     default: return 0;
+    }
+}
+
+/* Formats WriteSamples() can actually render. It used to accept everything
+   AsioTypeBytes() knows about, so a driver reporting Int16MSB / Float64 passed
+   the "unsupported format" gate, fell into the default: branch and played
+   100 % silence while the log said the sample format looked fine (audit N22). */
+static int IsTypeRenderable(long t)
+{
+    switch (t)
+    {
+    case ASIOSTInt16LSB:
+    case ASIOSTInt24LSB:
+    case ASIOSTInt32LSB: case ASIOSTInt32LSB16: case ASIOSTInt32LSB18:
+    case ASIOSTInt32LSB20: case ASIOSTInt32LSB24:
+    case ASIOSTFloat32LSB:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -430,6 +453,7 @@ static void WriteSamples(void* p, long type, int ch, const short* src, unsigned 
 
 static void FakePoke(void);   /* v13, defined in the fake-client section */
 static BOOL WoStart(int exclusive);   /* v13, defined in the WASAPI-output section */
+static void RsFlush(void);            /* v13.3, drop buffered resampler frames */
 
 static void AsioFill(long index)
 {
@@ -540,38 +564,23 @@ done:
 
 /* ---------------- driver load / prepare / teardown ---------------- */
 
-static BOOL AsioLoadDriver(const char* match)
+/* "" / "*" / "auto" = no name filter: try every registered driver in turn.
+   This is what the shipped config uses: the author's own card used to be the
+   default value, which is useless on any other machine. */
+static int AsioMatchAny(const char* m)
 {
-    HKEY hk;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO", 0, KEY_READ, &hk) != ERROR_SUCCESS)
-    {
-        Log("[asio] HKLM\\SOFTWARE\\ASIO not found");
-        return FALSE;
-    }
-    DWORD idx = 0;
-    for (;;)
-    {
-        char keyname[256] = { 0 }; DWORD klen = sizeof(keyname) - 1;
-        if (RegEnumKeyExA(hk, idx++, keyname, &klen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
-        HKEY hs;
-        if (RegOpenKeyExA(hk, keyname, 0, KEY_READ, &hs) != ERROR_SUCCESS) continue;
-        char clsid[256] = { 0 }; DWORD ty = 0, sz = sizeof(clsid) - 1;
-        RegQueryValueExA(hs, "clsid", NULL, &ty, (LPBYTE)clsid, &sz);
-        char desc[256] = { 0 }; sz = sizeof(desc) - 1;
-        RegQueryValueExA(hs, "description", NULL, &ty, (LPBYTE)desc, &sz);
-        RegCloseKey(hs);
-        const char* nm = desc[0] ? desc : keyname;
-        if (!clsid[0]) continue;
-        if (match && match[0] && strcmp(match, "*") != 0 && !strstr(nm, match)) continue;
-        wchar_t wc[256];
-        MultiByteToWideChar(CP_ACP, 0, clsid, -1, wc, 256);
-        CLSID id;
-        if (FAILED(CLSIDFromString(wc, &id))) continue;
-        HRESULT hr = CoCreateInstance(id, NULL, CLSCTX_INPROC_SERVER, id, (void**)&g_asio);
-        Log("[asio] CoCreateInstance('%s') -> hr=0x%08X", nm, (unsigned)hr);
-        if (SUCCEEDED(hr) && g_asio) { RegCloseKey(hk); return TRUE; }
-    }
-    RegCloseKey(hk);
+    return (!m || !m[0] || strcmp(m, "*") == 0 || _stricmp(m, "auto") == 0);
+}
+
+/* Instantiate one driver by CLSID. Returns TRUE when g_asio is usable. */
+static BOOL AsioConnectOne(const char* nm, const wchar_t* clsidW)
+{
+    CLSID id;
+    if (FAILED(CLSIDFromString((LPCOLESTR)clsidW, &id))) return FALSE;
+    HRESULT hr = CoCreateInstance(id, NULL, CLSCTX_INPROC_SERVER, id, (void**)&g_asio);
+    Log("[asio] CoCreateInstance('%s') -> hr=0x%08X", nm, (unsigned)hr);
+    if (SUCCEEDED(hr) && g_asio) return TRUE;
+    g_asio = NULL;
     return FALSE;
 }
 
@@ -594,20 +603,23 @@ static long AsioChooseBlock(long want, long mn, long mx, long pr, long gr)
     return block;
 }
 
-/* Create the ASIO engine but DO NOT start it yet.
- * Returns TRUE when ready to be started (buffers created, silence pre-filled). */
-static BOOL AsioPrepare(void)
+/* One driver, end to end. Every failure path releases the driver, otherwise a
+ * driver left init()ed stays claimed by this process for its whole lifetime
+ * (DAWs then see "device in use"). */
+static BOOL AsioPrepareOne(const char* regname, const wchar_t* clsidW)
 {
-    int buffers = 0;
-    if (!AsioLoadDriver(g_asioMatch)) return FALSE;
+    int buffers = 0, inited = 0;
+    g_apostOut = 0;
+    if (!AsioConnectOne(regname, clsidW)) return FALSE;
 
     if (g_asio->init((void*)GetDesktopWindow()) != ASIOTrue)
     {
         char e[124] = { 0 };
         g_asio->getErrorMessage(e);
         Log("[asio] init failed: %s", e);
-        goto fail;                     /* init() already succeeded -> must release */
+        goto fail;                     /* init() did NOT succeed -> only Release() */
     }
+    inited = 1;
     char nm[64] = { 0 };
     g_asio->getDriverName(nm);
     long nin = 0, nout = 0;
@@ -658,9 +670,9 @@ static BOOL AsioPrepare(void)
             Log("[asio] !! getChannelInfo(ch%ld) failed - refusing to run silent", c);
             goto fail;
         }
-        if (!AsioTypeBytes(g_aci[c].type))
+        if (!IsTypeRenderable(g_aci[c].type))
         {
-            Log("[asio] !! unsupported sample type %ld on ch%ld - refusing", g_aci[c].type, c);
+            Log("[asio] !! sample type %ld on ch%ld is not renderable - refusing", g_aci[c].type, c);
             goto fail;
         }
     }
@@ -670,8 +682,16 @@ static BOOL AsioPrepare(void)
     if (g_asio->getLatencies(&il, &ol) == ASE_OK)
         Log("[asio] latencies in=%ld out=%ld frames (%.2f / %.2f ms)", il, ol, il * 1000.0 / 44100.0, ol * 1000.0 / 44100.0);
 
-    if (!g_tmp) g_tmp = (short*)malloc((size_t)block * 2 * sizeof(short));
-    if (!g_tmp) { Log("[asio] staging alloc failed"); goto fail; }
+    /* (Re)size the staging buffer for THIS block. A retry after a rollback can
+       hand us a larger block, and RingRead() writes `block` frames - the old
+       one-shot allocation then overflowed the heap (audit N2/N21). */
+    if (!g_tmp || g_tmpBlock != block)
+    {
+        free(g_tmp);
+        g_tmp = (short*)malloc((size_t)block * 2 * sizeof(short));
+        g_tmpBlock = g_tmp ? block : 0;
+    }
+    if (!g_tmp) { Log("[asio] staging alloc failed (%ld frames)", block); goto fail; }
 
     /* pre-fill both halves with silence (spec: at least index 1) */
     for (long h = 0; h < 2; h++)
@@ -686,13 +706,65 @@ fail:
     Log("[asio] prepare failed -> releasing the driver (device becomes free again)");
     if (g_asio)
     {
-        g_asio->stop();
+        if (inited) g_asio->stop();          /* never call into a driver that refused init() */
         if (buffers) g_asio->disposeBuffers();
         g_asio->Release();
         g_asio = NULL;
     }
     g_apostOut = 0;
     return FALSE;
+}
+
+/* Try drivers in registry order until one is fully ready. The old code stopped
+ * at the first driver whose COM server merely answered: on a machine with
+ * several registered drivers that could be a virtual mixer/loopback device, a
+ * disconnected interface, or one that cannot run at 44.1 kHz - and the mod then
+ * sat in "prepare failed" while a perfectly good driver was never tried. */
+static BOOL AsioPrepare(void)
+{
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO", 0, KEY_READ, &hk) != ERROR_SUCCESS)
+    {
+        Log("[asio] HKLM\\SOFTWARE\\ASIO not found (no ASIO driver installed?)");
+        return FALSE;
+    }
+
+    int any = AsioMatchAny(g_asioMatch);
+    int matched = 0, tried = 0, ok = 0;
+    DWORD idx = 0;
+    for (;;)
+    {
+        char keyname[256] = { 0 }; DWORD klen = sizeof(keyname) - 1;
+        if (RegEnumKeyExA(hk, idx++, keyname, &klen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        HKEY hs;
+        if (RegOpenKeyExA(hk, keyname, 0, KEY_READ, &hs) != ERROR_SUCCESS) continue;
+        char clsid[256] = { 0 }; DWORD ty = 0, sz = sizeof(clsid) - 1;
+        RegQueryValueExA(hs, "clsid", NULL, &ty, (LPBYTE)clsid, &sz);
+        char desc[256] = { 0 }; sz = sizeof(desc) - 1;
+        RegQueryValueExA(hs, "description", NULL, &ty, (LPBYTE)desc, &sz);
+        RegCloseKey(hs);
+        const char* nm = desc[0] ? desc : keyname;
+        if (!clsid[0]) continue;                       /* unplayable registry entry */
+        if (!any && !strstr(nm, g_asioMatch)) continue;
+
+        matched++;
+        if (tried >= 8) { Log("[asio] !! %d matching driver(s), stopped after 8 attempts", matched); break; }
+        tried++;
+
+        wchar_t wc[256] = { 0 };
+        MultiByteToWideChar(CP_ACP, 0, clsid, -1, wc, 256);
+        if (AsioPrepareOne(nm, wc)) { ok = 1; break; }
+        Log("[asio] driver '%s' is not usable -> trying the next registered driver", nm);
+    }
+    RegCloseKey(hk);
+
+    if (!ok)
+        Log("[asio] !! no usable ASIO driver (match='%s', %d candidate(s), %d attempt(s))",
+            g_asioMatch, matched, tried);
+    else if (tried > 1 || any)
+        Log("[asio] picked the first usable driver after %d attempt(s); if this is not your "
+            "interface, run tools/asio_list.exe and pin asio_driver=<name>", tried);
+    return ok ? TRUE : FALSE;
 }
 
 static void AsioTeardown(void)
@@ -764,8 +836,9 @@ static BOOL WaitForTapSteady(void)
 
 static DWORD WINAPI AsioStartThread(LPVOID)
 {
-    /* IMPORTANT: the Focusrite ASIO driver's COM server only answers the
-       driver-clsid IID from an STA apartment (MTA returns E_NOINTERFACE). */
+    /* IMPORTANT: the ASIO driver used during development only answers the
+       driver-clsid IID from an STA apartment (MTA returns E_NOINTERFACE), and
+       this is not unique to it - always initialise ASIO on an STA thread. */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     InterlockedExchange(&g_asioState, 2);
 
@@ -1288,6 +1361,10 @@ static HRESULT STDMETHODCALLTYPE Fake_GetStreamLatency(IAudioClient* s, REFERENC
 }
 static HRESULT STDMETHODCALLTYPE Fake_GetCurrentPadding(IAudioClient* s, UINT32* p)
 {
+    /* Close enough for CRI's bookkeeping: with a resampler active the ring is
+       source frames while the stream counts output frames, so this over-reports
+       by up to 10 ms. GetBuffer() uses the same RingAvail() gate, so the two
+       stay consistent and the ring cannot overflow (audit N9). */
     if (FakeIsSelf(s)) { if (p) *p = RingAvail(); return S_OK; }
     return oGPad ? oGPad(s, p) : E_FAIL;
 }
@@ -1336,6 +1413,7 @@ static HRESULT STDMETHODCALLTYPE Fake_Stop(IAudioClient* s)
     {
         InterlockedExchange(&g_fake.running, 0);
         RingResyncToLatest(0);   /* the next song must not start with old audio */
+        RsFlush();               /* ...including the resampler's own 441 frames */
         Log("[fake] Stop()");
         return S_OK;
     }
@@ -1346,6 +1424,7 @@ static HRESULT STDMETHODCALLTYPE Fake_Reset(IAudioClient* s)
     if (FakeIsSelf(s))
     {
         RingResyncToLatest(0);   /* restart/seek: drop up to 10 ms of stale audio */
+        RsFlush();
         return S_OK;
     }
     return oReset ? oReset(s) : E_FAIL;
@@ -1445,6 +1524,16 @@ static short  g_rsOut[2048 * 2];
 static void RsReset(void)
 {
     g_rsStep = 1.0; g_rsFrac = 0.0; g_rsPrimed = 0; g_rsHasNext = 0;
+    g_rsN = g_rsI = 0;
+    g_rsCur[0] = g_rsCur[1] = g_rsNext[0] = g_rsNext[1] = 0;
+}
+
+/* Drop everything buffered, but KEEP the step: Stop()/Reset() must not replay
+   up to 441 frames of the previous song, and they must not silently turn a
+   48 kHz endpoint back into "no resampling" either (audit N25). */
+static void RsFlush(void)
+{
+    g_rsFrac = 0.0; g_rsPrimed = 0; g_rsHasNext = 0;
     g_rsN = g_rsI = 0;
     g_rsCur[0] = g_rsCur[1] = g_rsNext[0] = g_rsNext[1] = 0;
 }
@@ -1556,13 +1645,33 @@ static DWORD WINAPI WoThread(LPVOID)
     InterlockedExchange(&g_woState, 3);
     InterlockedExchange(&g_woReading, 1);
     Log("[wo] output running");
+    int nopulse = 0, faults = 0;
     while (g_woRun)
     {
         DWORD w = WaitForSingleObject(g_woEvent, 200);
         if (!g_woRun) break;
-        if (w != WAIT_OBJECT_0) continue;
+        if (w != WAIT_OBJECT_0)
+        {
+            /* No event for 200 ms. One missed event is normal (the engine is
+               idle), so this only *reports* it - the failure detection below is
+               the one that acts. */
+            if (++nopulse == 25) Log("[wo] !! no data event for 5 s (device paused?)");
+            continue;
+        }
+        nopulse = 0;
         UINT32 pad = 0;
-        if (FAILED(g_woClient->GetCurrentPadding(&pad))) { Sleep(2); continue; }
+        HRESULT hp = g_woClient->GetCurrentPadding(&pad);
+        /* This used to be "Sleep(2); continue;" - so a device that was
+           unplugged, disabled or taken over by another app left the thread
+           spinning forever in silence: state stayed 3, the drain gate stayed
+           shut and not a single line was logged (audit N6). */
+        if (FAILED(hp))
+        {
+            Log("[wo] !! GetCurrentPadding hr=0x%08X %s -> backend is dead, restarting it",
+                (unsigned)hp, HrBrief(hp));
+            InterlockedExchange(&g_woFault, 1);
+            break;
+        }
         UINT32 free_ = g_woFrames > pad ? g_woFrames - pad : 0;
         /* Only write what the ring can actually produce. Two units are involved:
            free_ is OUTPUT frames (device rate), RingAvail() is SOURCE frames
@@ -1576,19 +1685,30 @@ static DWORD WINAPI WoThread(LPVOID)
         if (n)
         {
             BYTE* p = NULL;
-            if (SUCCEEDED(g_woRender->GetBuffer(n, &p)) && p)
+            HRESULT hb = g_woRender->GetBuffer(n, &p);
+            if (SUCCEEDED(hb) && p)
             {
+                faults = 0;
                 if (g_woFloat) WoFillFloat(p, n); else WoFill16(p, n);
                 g_woRender->ReleaseBuffer(n, 0);
                 InterlockedIncrement(&g_woCbs);
                 InterlockedExchangeAdd64(&g_woOut, (LONG64)n);
             }
+            else if (++faults >= 50)
+            {
+                Log("[wo] !! GetBuffer failed %d times in a row (hr=0x%08X) -> restarting the backend",
+                    faults, (unsigned)hb);
+                InterlockedExchange(&g_woFault, 1);
+                break;
+            }
         }
         FakePoke();
     }
     InterlockedExchange(&g_woReading, 0);
-    g_woClient->Stop();
+    if (g_woClient) g_woClient->Stop();
     InterlockedExchange(&g_woAlive, 0);
+    if (InterlockedExchange(&g_woFault, 0))
+        InterlockedExchange(&g_woState, 4);   /* claimable again -> watchdog rebuilds */
     Log("[wo] thread exit");
     return 0;
 }
@@ -1600,6 +1720,15 @@ static const GUID kSubFloat =
 static BOOL WoInit(int exclusive)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* ignore RPC_E_CHANGED_MODE */
+
+    /* Restart after a device loss: the previous stream is dead, but if a stuck
+       writer thread still owns it, leave it alone - leak, do not crash. */
+    if (!g_woAlive)
+    {
+        if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
+        if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
+        if (g_woEvent)  { CloseHandle(g_woEvent); g_woEvent = NULL; }
+    }
 
     IMMDeviceEnumerator* en = NULL;
     IMMDevice* dev = NULL;
@@ -1720,8 +1849,8 @@ static void WoShutdown(void)
 }
 
 /* Init + start. exclusive==1 -> exclusive, else shared.
-   Exclusive gets a 600 ms self-test: some drivers (Focusrite USB here) hand out
-   a 5 ms buffer but only consume ~88% of real time, which starves the queue and
+   Exclusive gets a 600 ms self-test: some USB interfaces hand out a 5 ms buffer
+   but only consume ~88% of real time, which starves the queue and
    makes the game's music stutter/repeat. The self-test now cross-checks the
    device clock (IAudioClock) as well, because "frames written" alone can look
    healthy while the hardware is not moving. */
@@ -1734,7 +1863,11 @@ static BOOL WoStart(int exclusive)
         if (st == 3) return TRUE;
         if (st == 0 || st == 4)     /* 4 = previous failure; allow a retry */
         {
-            if (InterlockedCompareExchange(&g_woState, 2, st) == st) { claimed = TRUE; break; }
+            /* never re-init on top of a writer thread that is still alive:
+               WoShutdown() sets 4 after a 2 s timeout precisely because that
+               thread could not be stopped. */
+            if (!g_woAlive &&
+                InterlockedCompareExchange(&g_woState, 2, st) == st) { claimed = TRUE; break; }
         }
         Sleep(5);
     }
@@ -1969,7 +2102,12 @@ static void ReadConfig(void)
 
             if (_stricmp(key, "asio_driver") == 0)
             {
-                strncpy_s(g_asioMatch, sizeof(g_asioMatch), v, _TRUNCATE);
+                /* tolerate asio_driver = "*" - the docs quote the value, so
+                   people paste the quotes too */
+                char* s = v;
+                size_t L = strlen(s);
+                if (L >= 2 && s[0] == '"' && s[L - 1] == '"') { s[L - 1] = '\0'; s++; }
+                strncpy_s(g_asioMatch, sizeof(g_asioMatch), s, _TRUNCATE);
             }
             else if (_stricmp(key, "output") == 0)
             {
@@ -2014,9 +2152,10 @@ static void ReadConfig(void)
         Log("!! fake_client=1 with asio=0 and output=asio -> forcing output=shared");
         g_outMode = 2;
     }
-    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s' | fake_client=%d | output=%s",
-        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch, g_fakeClient,
-        g_outMode == 0 ? "asio" : (g_outMode == 1 ? "excl" : "shared"));
+    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s'%s | fake_client=%d | output=%s",
+        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch,
+        AsioMatchAny(g_asioMatch) ? " (auto: first usable driver)" : "",
+        g_fakeClient, g_outMode == 0 ? "asio" : (g_outMode == 1 ? "excl" : "shared"));
     Log("MODE: %s", g_fakeClient ? "v13 takeover (no engine buffer)" : "v9 buffer trim only");
 }
 
@@ -2061,6 +2200,26 @@ static void DeviceProbeOnce(const char* phase)
     en->Release();
 }
 
+/* A dead output stream used to mean permanent silence. WoThread now bails out
+   with state 4; this brings the stream back - the usual cause is Windows
+   switching the default endpoint when headphones are plugged/unplugged. Capped
+   and backed off so a genuinely broken device cannot spin the init path. */
+static volatile LONG g_woRetry = 0;
+static volatile ULONGLONG g_woNextTry = 0;
+
+static void WoWatchdog(void)
+{
+    if (!g_fakeClient) return;                  /* legacy tap path reclaims WASAPI itself */
+    if (g_woState != 4) { g_woRetry = 0; g_woNextTry = 0; return; }
+    if (g_woRetry >= 5) return;
+    if (GetTickCount64() < g_woNextTry) return;
+    g_woRetry++;
+    g_woNextTry = GetTickCount64() + 3000;
+    Log("[wo] watchdog: output backend is down -> restarting shared (attempt %ld)",
+        (long)g_woRetry);
+    if (!WoStart(0)) Log("[wo] !! watchdog restart failed");
+}
+
 static DWORD WINAPI WatchdogThread(LPVOID)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -2083,6 +2242,8 @@ static DWORD WINAPI WatchdogThread(LPVOID)
             if (MuteSession(FALSE))
                 Log("[fix] cleared stale session-mute residue (deferred)");
         }
+
+        WoWatchdog();
 
         if (i <= 30 || (i % 60) == 0)
             Log("[hb] up=%llds init=%ld rc=%ld | asio en=%d st=%ld cbs=%ld taps=%lld und=%ld drops=%lld zeroTap=%ld zeroed=%lld kicked=%ld",
@@ -2146,8 +2307,14 @@ static void WriteDetachReport(void)
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     (void)hinstDLL; (void)lpvReserved;
-    if (fdwReason == DLL_PROCESS_DETACH && g_sessionActive && g_detachPath[0])
-        WriteDetachReport();
+    if (fdwReason == DLL_PROCESS_DETACH)
+    {
+        /* timeBeginPeriod(1) raises the timer resolution for the WHOLE system,
+           so it has to be given back even when the process is going away
+           (audit N11). */
+        if (InterlockedExchange(&g_timerPeriod, 0)) timeEndPeriod(1);
+        if (g_sessionActive && g_detachPath[0]) WriteDetachReport();
+    }
     return TRUE;
 }
 
@@ -2190,10 +2357,8 @@ extern "C" __declspec(dllexport) void PreInit(void)
     fopen_s(&g_log, lp, "ab");
     if (!g_log) return;
 
-    timeBeginPeriod(1);   /* 1 ms timer resolution: Sleep(1) no longer rounds up to 15.6 ms */
-
     Log("============================================================");
-    Log(" audio_hook v13.2 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.3 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");
@@ -2203,6 +2368,11 @@ extern "C" __declspec(dllexport) void PreInit(void)
         Log("audio_hook.off present -> doing nothing.");
         return;
     }
+
+    /* Only when we are really running: this raises the timer resolution for the
+       whole system, and DllMain gives it back at detach (audit N11). */
+    g_timerPeriod = 1;
+    timeBeginPeriod(1);   /* 1 ms timer resolution: Sleep(1) no longer rounds up to 15.6 ms */
 
     g_sessionActive = 1;
     ReadConfig();
