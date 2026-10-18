@@ -1,16 +1,37 @@
 ﻿/*
  * session_tool.cpp -- list audio sessions + mute state; unmute/mute by name.
- * Build: same MSVC x64 setup as audio_probe. Pure ASCII output + report file.
+ *
  * Usage:
- *   session_tool                 -> list all render sessions (pid, name, state, muted, volume)
- *   session_tool --unmute <sub>  -> SetMute(FALSE) on every session whose process name contains <sub>
- *   session_tool --mute <sub>    -> SetMute(TRUE)  (diagnostic only)
+ *   session_tool                  list all render sessions
+ *                                 (device, pid, process, state, muted, volume, peak)
+ *   session_tool --unmute <sub>   clear mute on every session whose process name
+ *                                 contains <sub> (case-insensitive)
+ *   session_tool --mute <sub>     set mute (diagnostic only)
+ *   session_tool --list           explicit list (same as no arguments)
+ *   session_tool --help
+ *
+ * Exit codes:
+ *   0  listed OK / at least one session was changed
+ *   1  COM or endpoint enumeration failure
+ *   2  --unmute/--mute matched no session
+ *   3  bad command line
+ *
+ * Why the extra checks: an earlier build silently did nothing when the process
+ * name case did not match (Windows names are case-insensitive), and returned 0
+ * either way, which made "the game is still muted" impossible to diagnose.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <psapi.h>
+
 /* IAudioMeterInformation {C02216F6-8C67-4B5B-9D00-D008E73E0064} -- declared locally to
    avoid pulling endpointvolume.h (it clashes with the MinGW/winsdk mix used here). */
 static const GUID kIID_IAudioMeterInformation =
@@ -19,11 +40,6 @@ struct IAudioMeterMin : public IUnknown
 {
     virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* pfPeak) = 0;
 };
-#include <functiondiscoverykeys_devpkey.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <psapi.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
@@ -36,146 +52,266 @@ static void Out(const char* fmt, ...)
     va_list ap;
     va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap);
     if (g_report) { va_start(ap, fmt); vfprintf(g_report, fmt, ap); va_end(ap); }
+    fflush(stdout);
+}
+
+static int IsConsole(void)
+{
+    DWORD mode = 0;
+    return GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) ? 1 : 0;
+}
+
+/* Device names are UTF-8 in the report and on a UTF-8 console; CP_ACP turned
+   every non-ASCII name (e.g. Chinese "扬声器") into question marks. */
+static void WideToUtf8(LPCWSTR src, char* out, size_t cch)
+{
+    out[0] = 0;
+    if (src && cch) WideCharToMultiByte(CP_UTF8, 0, src, -1, out, (int)cch - 1, NULL, NULL);
+}
+
+/* ASCII case-insensitive substring search (process names are case-insensitive
+   on Windows, so "divamegamix" must match "DivaMegaMix.exe"). */
+static int ContainsNoCase(const char* hay, const char* needle)
+{
+    if (!hay || !needle || !needle[0]) return 0;
+    size_t nl = strlen(needle);
+    for (const char* p = hay; *p; p++)
+        if (_strnicmp(p, needle, nl) == 0) return 1;
+    return 0;
 }
 
 static void GetProcName(DWORD pid, char* out, size_t cch)
 {
+    if (!cch) return;
+    out[0] = 0;
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) { strncpy_s(out, cch, "(gone)", _TRUNCATE); return; }
-    DWORD n = (DWORD)cch - 1;
-    if (!QueryFullProcessImageNameA(h, 0, out, &n))
+    if (!h)
+    {
+        DWORD e = GetLastError();
+        strncpy_s(out, cch, (e == ERROR_ACCESS_DENIED) ? "(denied)" : "(gone)", _TRUNCATE);
+        return;
+    }
+    DWORD n = (DWORD)cch;
+    if (!QueryFullProcessImageNameA(h, 0, out, &n) || n == 0)
         strncpy_s(out, cch, "?", _TRUNCATE);
+    else
+        out[cch - 1] = 0;
     CloseHandle(h);
     const char* bs = strrchr(out, '\\');
     if (bs) memmove(out, bs + 1, strlen(bs + 1) + 1);
+}
+
+/* The report goes next to the exe, not into whatever directory the user
+   happened to start the tool from (Program Files is read-only for non-admins). */
+static void OpenReport(void)
+{
+    char path[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameA(NULL, path, MAX_PATH)) return;
+    char* slash = strrchr(path, '\\');
+    if (slash) *(slash + 1) = '\0';
+    else path[0] = '\0';
+    strncat_s(path, sizeof(path), "session_tool_report.txt", _TRUNCATE);
+    fopen_s(&g_report, path, "wb");
+}
+
+static void Usage(void)
+{
+    printf("session_tool [--list] [--unmute <name> | --mute <name>] [--help]\n"
+           "  <name> is a case-insensitive substring of the process name, e.g. DivaMegaMix\n");
 }
 
 int main(int argc, char** argv)
 {
     const char* action = NULL;      /* NULL=list, "unmute", "mute" */
     const char* match  = NULL;
+
     for (int i = 1; i < argc; i++)
     {
-        if ((!strcmp(argv[i], "--unmute") || !strcmp(argv[i], "--mute")) && i + 1 < argc)
+        if (!_stricmp(argv[i], "--help") || !_stricmp(argv[i], "-h")) { Usage(); return 0; }
+        else if (!_stricmp(argv[i], "--list")) { /* default action */ }
+        else if (!_stricmp(argv[i], "--unmute") || !_stricmp(argv[i], "--mute"))
         {
-            action = argv[i] + 2;   /* "unmute"/"mute" */
-            match = argv[++i];
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "!! %s needs a process-name substring\n", argv[i]);
+                Usage();
+                return 3;
+            }
+            action = (argv[i][2] == 'u') ? "unmute" : "mute";
+            match  = argv[++i];
+        }
+        else
+        {
+            fprintf(stderr, "!! unknown argument '%s'\n", argv[i]);
+            Usage();
+            return 3;
         }
     }
 
-    fopen_s(&g_report, "session_tool_report.txt", "wb");
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (IsConsole()) SetConsoleOutputCP(CP_UTF8);
+
+    OpenReport();
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED)))
+    {
+        Out("!! CoInitializeEx failed\n");
+        if (g_report) fclose(g_report);
+        return 1;
+    }
 
     IMMDeviceEnumerator* en = NULL;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                   __uuidof(IMMDeviceEnumerator), (void**)&en);
-    if (FAILED(hr) || !en) { Out("!! enumerator failed\n"); if (g_report) fclose(g_report); return 1; }
+    if (FAILED(hr) || !en)
+    {
+        Out("!! enumerator failed hr=0x%08X\n", (unsigned)hr);
+        CoUninitialize();
+        if (g_report) fclose(g_report);
+        return 1;
+    }
 
     IMMDeviceCollection* col = NULL;
-    en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col);
-    UINT32 devCnt = 0;
-    if (col) col->GetCount(&devCnt);
+    hr = en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col);
+    if (FAILED(hr) || !col)
+    {
+        Out("!! EnumAudioEndpoints failed hr=0x%08X\n", (unsigned)hr);
+        en->Release();
+        CoUninitialize();
+        if (g_report) fclose(g_report);
+        return 1;
+    }
 
-    int acted = 0;
+    UINT32 devCnt = 0;
+    if (FAILED(col->GetCount(&devCnt))) devCnt = 0;
+
+    int matched = 0, acted = 0;
     for (UINT32 di = 0; di < devCnt; di++)
     {
         IMMDevice* dev = NULL;
         if (FAILED(col->Item(di, &dev)) || !dev) continue;
 
-        LPWSTR did = NULL;
         char devName[256] = "?";
+        char devId[128] = "";
         IPropertyStore* ps = NULL;
         if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps)
         {
             PROPVARIANT pv; PropVariantInit(&pv);
-            if (SUCCEEDED(ps->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
-            {
-                WideCharToMultiByte(CP_ACP, 0, pv.pwszVal, -1, devName, sizeof(devName) - 1, NULL, NULL);
-                PropVariantClear(&pv);
-            }
+            HRESULT gv = ps->GetValue(PKEY_Device_FriendlyName, &pv);
+            if (SUCCEEDED(gv) && pv.vt == VT_LPWSTR)
+                WideToUtf8(pv.pwszVal, devName, sizeof(devName));
+            if (SUCCEEDED(gv)) PropVariantClear(&pv);   /* clear for ANY variant type */
             ps->Release();
         }
+        LPWSTR did = NULL;
         if (SUCCEEDED(dev->GetId(&did)) && did)
         {
-            char ida[64] = { 0 };
-            WideCharToMultiByte(CP_ACP, 0, did, -1, ida, sizeof(ida) - 1, NULL, NULL);
-            const char* brace = strrchr(ida, '{');
-            Out("== device '%s' [%s]\n", devName, brace ? brace : ida);
+            char tmp[512] = { 0 };
+            WideToUtf8(did, tmp, sizeof(tmp));
+            const char* brace = strrchr(tmp, '{');
+            strncpy_s(devId, sizeof(devId), brace ? brace : tmp, _TRUNCATE);
             CoTaskMemFree(did);
         }
+
+        /* Always print a header: a failed GetId used to leave the sessions of
+           this device listed under the previous device's name. */
+        if (devId[0]) Out("== device '%s' [%s]\n", devName, devId);
+        else          Out("== device '%s'\n", devName);
 
         IAudioSessionManager2* mgr = NULL;
         if (FAILED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&mgr)) || !mgr)
         {
+            Out("    (cannot activate the session manager)\n");
             dev->Release();
             continue;
         }
+
         IAudioSessionEnumerator* se = NULL;
-        if (SUCCEEDED(mgr->GetSessionEnumerator(&se)) && se)
+        if (FAILED(mgr->GetSessionEnumerator(&se)) || !se)
         {
-            int n = 0;
-            se->GetCount(&n);
-            for (int i = 0; i < n; i++)
-            {
-                IAudioSessionControl* ctl = NULL;
-                if (FAILED(se->GetSession(i, &ctl)) || !ctl) continue;
-                DWORD pid = 0;
-                char proc[256] = "?";
-                IAudioSessionControl2* ctl2 = NULL;
-                if (SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2)) && ctl2)
-                {
-                    ctl2->GetProcessId(&pid);
-                    if (pid) GetProcName(pid, proc, sizeof(proc));
-                    ctl2->Release();
-                }
-                AudioSessionState st = AudioSessionStateInactive;
-                ctl->GetState(&st);
-                const char* stn = (st == AudioSessionStateActive) ? "ACTIVE" :
-                                  (st == AudioSessionStateInactive) ? "Inactive" : "Expired";
-
-                ISimpleAudioVolume* vol = NULL;
-                BOOL muted = FALSE;
-                float lvl = -1.0f;
-                if (SUCCEEDED(ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&vol)) && vol)
-                {
-                    vol->GetMute(&muted);
-                    vol->GetMasterVolume(&lvl);
-                }
-
-                float peak = -1.0f;
-                IAudioMeterMin* meter = NULL;
-                if (SUCCEEDED(ctl->QueryInterface(kIID_IAudioMeterInformation, (void**)&meter)) && meter)
-                {
-                    meter->GetPeakValue(&peak);
-                    meter->Release();
-                }
-
-                Out("    session pid=%-6lu %-28s [%s] muted=%s volume=%.2f peak=%.4f\n",
-                    (unsigned long)pid, proc, stn, muted ? "YES" : "no", lvl, peak);
-
-                if (action && match && strstr(proc, match))
-                {
-                    if (vol)
-                    {
-                        HRESULT hr2 = vol->SetMute(action[0] == 'u' ? FALSE : TRUE, NULL);
-                        Out("    >>> %s '%s' -> hr=0x%08X\n", action, proc, (unsigned)hr2);
-                        if (SUCCEEDED(hr2)) acted++;
-                    }
-                }
-                if (vol) vol->Release();
-                ctl->Release();
-            }
-            se->Release();
+            Out("    (no session enumerator)\n");
+            mgr->Release();
+            dev->Release();
+            continue;
         }
+
+        int n = 0;
+        if (FAILED(se->GetCount(&n))) n = 0;
+        for (int i = 0; i < n; i++)
+        {
+            IAudioSessionControl* ctl = NULL;
+            if (FAILED(se->GetSession(i, &ctl)) || !ctl) continue;
+
+            DWORD pid = 0;
+            char proc[256] = "?";
+            IAudioSessionControl2* ctl2 = NULL;
+            if (SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2)) && ctl2)
+            {
+                ctl2->GetProcessId(&pid);
+                if (pid) GetProcName(pid, proc, sizeof(proc));
+                ctl2->Release();
+            }
+
+            AudioSessionState st = AudioSessionStateInactive;
+            ctl->GetState(&st);
+            const char* stn = (st == AudioSessionStateActive) ? "ACTIVE" :
+                              (st == AudioSessionStateInactive) ? "Inactive" : "Expired";
+
+            ISimpleAudioVolume* vol = NULL;
+            BOOL muted = FALSE;
+            float lvl = -1.0f;
+            if (SUCCEEDED(ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&vol)) && vol)
+            {
+                vol->GetMute(&muted);
+                vol->GetMasterVolume(&lvl);
+            }
+
+            float peak = -1.0f;
+            IAudioMeterMin* meter = NULL;
+            if (SUCCEEDED(ctl->QueryInterface(kIID_IAudioMeterInformation, (void**)&meter)) && meter)
+            {
+                meter->GetPeakValue(&peak);
+                meter->Release();
+            }
+
+            Out("    session pid=%-6lu %-28s [%s] muted=%s volume=%.2f peak=%.4f\n",
+                (unsigned long)pid, proc, stn, muted ? "YES" : "no", lvl, peak);
+
+            /* pid 0 is the system-sounds session; never touch it by name */
+            if (action && match && pid && ContainsNoCase(proc, match))
+            {
+                matched++;
+                if (vol)
+                {
+                    HRESULT hr2 = vol->SetMute((action[0] == 'u') ? FALSE : TRUE, NULL);
+                    Out("    >>> %s '%s' -> hr=0x%08X\n", action, proc, (unsigned)hr2);
+                    if (SUCCEEDED(hr2)) acted++;
+                }
+                else
+                    Out("    >>> %s '%s' -> no ISimpleAudioVolume\n", action, proc);
+            }
+
+            if (vol) vol->Release();
+            ctl->Release();
+        }
+        se->Release();
         mgr->Release();
         dev->Release();
     }
-    if (col) col->Release();
+
+    col->Release();
     en->Release();
     CoUninitialize();
 
     if (action)
-        Out("=== %s done: %d session(s) matched '%s' ===\n", action, acted, match);
+    {
+        Out("=== %s done: %d matched, %d changed (pattern '%s') ===\n", action, matched, acted, match);
+        if (!matched)
+            Out("    hint: the game must be RUNNING and playing something; run with no\n"
+                "          arguments to see every session name.\n");
+    }
+    else
+        Out("=== %u device(s) listed ===\n", devCnt);
+
     if (g_report) fclose(g_report);
+    if (action && !acted) return 2;
     return 0;
 }

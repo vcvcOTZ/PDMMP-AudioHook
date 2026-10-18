@@ -262,8 +262,12 @@ run while the game is playing unless noted.
 asio_list                          interactive menu (arrow keys)
 asio_list --list                   plain text list, no menu
 asio_list --test "Focusrite USB"   play the tone on that driver directly
+asio_list --test "*"               play on the first registered driver
 asio_list --help
 ```
+
+Exit codes: `0` played · `1` no drivers registered · `2` nothing matched / playback
+failed · `3` bad command line · `4` the driver crashed.
 
 The interactive menu lists every driver registered under
 `HKLM\SOFTWARE\ASIO`; **Up/Down** moves the selection, **Enter** plays a 3 s 440 Hz
@@ -285,30 +289,39 @@ The tone is deliberately gentle: `0.12` amplitude with a 120 ms fade-in, so it w
 blast your monitors. **Whichever speaker/headphone the tone comes out of is the physical
 output that driver drives** — that is the whole point of the tool.
 
-Use the printed name in `asio_driver`. Matching is a **substring** search that takes the
-**first** hit, so a short string can select the wrong driver (on a machine with both
-`Focusrite Thunderbolt ASIO` and `Focusrite USB ASIO`, writing `Focusrite` picks
-Thunderbolt). Always copy the full name.
+Use the printed name in `asio_driver`. Matching is a **case-insensitive substring**
+search that takes the **first** hit, so a short string can select the wrong driver (on a
+machine with both `Focusrite Thunderbolt ASIO` and `Focusrite USB ASIO`, writing
+`Focusrite` picks Thunderbolt). Always copy the full name.
 
-Drivers that crash on load (some Ableton builds do) are caught with SEH, reported as
-`CRASH`, and skipped — one bad driver cannot take down the tool.
+A name that matches **nothing is an error** (`exit 2`, the registered names are printed):
+it is never silently redirected to the first driver, which used to let you "verify" the
+wrong device.
+
+Drivers that crash on load (some Ableton builds do) are caught with SEH and reported as
+`driver crashed` — one bad driver cannot take down the tool, and each test now closes its
+stream (`stop` → `disposeBuffers` → `Release`) so the next driver really gets the device.
 
 ### `excl_rate_probe` — is exclusive mode real on this device?
 
 ```
-excl_rate_probe --list
+excl_rate_probe --list                       list render endpoints, default marked
 excl_rate_probe "<device substring>" [--seconds N] [--shared]
 ```
 
-Defaults: the **default render endpoint**, **2 s per format**. It tries every plausible
-format (44.1 / 48 kHz × 16 / 24 / 32-bit float), re-activates the client for each one,
-and only trusts a format if the **device clock really advances** — `Initialize()`
-returning `S_OK` proves nothing.
+Defaults: the **default render endpoint**, **2 s per format** (`--seconds` accepts 1…60;
+a bad value or an unknown option is a usage error, not silently ignored). It tries every
+plausible format (44.1 / 48 kHz × 16 / 24 / 32-bit float), re-activates the client for
+each one, and only trusts a format if the **device clock really advances** —
+`Initialize()` returning `S_OK` proves nothing.
+
+Exit codes: `0` measured ≥ 95 % of real time · `3` measured below that (or nothing
+worked) · `1` device/COM error · `2` bad command line.
 
 ```
 -- 44100 Hz / 16 bit / 2 ch --
    initialized: buffer 441 fr (10.00 ms) - measuring...
-   -> written 43773 fr/s, device clock 43950 fr/s (99.7% of 44100)
+   -> written 43773 fr/s, device clock 43950 fr/s
 
 == SUMMARY 'Focusrite USB Audio'
    best: 44100 Hz / 16 bit / 2 ch  buffer 441 fr  ->  99.7% of real time
@@ -317,9 +330,16 @@ returning `S_OK` proves nothing.
 | Line | Meaning |
 |---|---|
 | `written … fr/s` | frames the tool actually pushed into the buffer |
-| `device clock … fr/s` | how fast `IAudioClock` advanced — **the honest number** |
+| `device clock … fr/s` | `IAudioClock` advance, converted to frames — **the honest number** |
+| `(352800 units/s)` | the clock's own tick rate; `GetFrequency()` is used to normalise it |
 | `not supported (0x88890008)` | the driver refuses that format in exclusive mode |
-| `Initialize 0x88890019` | buffer size not aligned; the tool retries aligned, then moves on |
+| `Initialize 0x88890019` | buffer size not aligned — that candidate is skipped |
+
+> Device clocks do **not** count in samples at the nominal rate: a shared-mode stream on
+> the test machine reports **352800 units/s** (8× 44.1 kHz). The tool divides by
+> `GetFrequency()` before turning the number into a percentage, so 100 % really means
+> real time. If a driver has no usable `IAudioClock`, the written rate is used instead and
+> the line says so.
 
 How to read the summary:
 
@@ -336,12 +356,19 @@ stream, which is the quickest way to prove an endpoint is alive at all.
 
 ```
 session_tool                    list sessions on every render device
+session_tool --list             same, explicit
 session_tool --unmute <substr>  clear mute on every session whose process name matches
 session_tool --mute <substr>    set mute (diagnostic only)
 ```
 
+The match is **case-insensitive** (`divamegamix` works), the system-sounds session
+(`pid 0`) is never touched, and the exit code is `2` when a pattern matched nothing —
+so a script can tell "unmuted" from "the game was not running". A plain-text report is
+written next to the exe (`session_tool_report.txt`), and device names are printed as
+UTF-8, so Chinese/Japanese endpoint names are readable.
+
 ```
-== device 'Focusrite USB Audio' [{...}]
+== device '扬声器 (4- Focusrite USB Audio)' [{...}]
     session pid=16672  DivaMegaMix.exe   [Active] muted=no volume=1.00 peak=0.4182
     session pid=13564  msedge.exe        [Inactive] muted=no volume=1.00 peak=0.0000
 ```

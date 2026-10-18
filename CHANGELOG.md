@@ -125,6 +125,54 @@ backends and non-44.1 kHz devices.
 
 Compiles with **zero warnings at `/W3` and `/W4`.
 
+### Companion tools (rebuilt 2026-10-18, same release)
+
+All three tools were re-reviewed and hardened; the DLL is unchanged.
+
+**`asio_list`**
+- A `--test NAME` that matches nothing used to fall back to the **first** driver — so you
+  could "verify" the wrong device. It is now an error (exit 2) that lists the real names.
+- Case-insensitive matching (`focusrite usb` works), and `--test` without a value or an
+  unknown argument is a usage error instead of being ignored.
+- Cleanup now runs `stop` → `disposeBuffers` → `Release` on every path. The old build
+  never freed the buffers, so testing driver after driver could leave the previous one
+  (and sometimes its device) claimed.
+- The tone's phase was advanced once per **channel**, so left/right were one block apart
+  and the fade-in ran twice as fast. Phase is now advanced once per buffer.
+- `getBufferSize` / `getChannels` / `getChannelInfo` are checked, unknown sample types are
+  refused (the old build silently played silence if `getChannelInfo` failed), and a
+  reported `maxBufferSize` of 0 can no longer produce a block size of 0.
+- Registry entries without a `clsid` are skipped instead of listed as unplayable.
+- Exit codes: 0 ok, 1 no drivers, 2 failed/no match, 3 usage, 4 driver crashed.
+
+**`excl_rate_probe`**
+- **`IAudioClock` ticks are not samples.** A shared-mode stream on this machine reports
+  **352800 units/s** (8× 44.1 kHz), so the old "clock ÷ nominal" math printed a healthy
+  endpoint as **784 %**. The percentage is now `clock delta ÷ GetFrequency()`, and the
+  raw unit rate is printed for auditability.
+- `--shared` used to fall through into the EXCLUSIVE summary and print "NO working
+  exclusive format" after a perfectly good measurement; it now has its own summary.
+- `--list` dereferenced a NULL device collection when `EnumAudioEndpoints` failed.
+- The `0x88890019` "retry" re-sent byte-identical parameters (dead code); it is removed
+  and the alignment error is reported per candidate.
+- Device names are UTF-8 (they printed as `?????`), the default endpoint is marked in
+  `--list`, `--seconds` is clamped to 1…60 and validated, unknown options are errors.
+- Falls back to the written rate when a driver has no usable `IAudioClock`, instead of
+  reporting 0 %.
+- Exit codes: 0 measured ≥ 95 %, 3 below that / nothing worked, 1 device error, 2 usage.
+
+**`session_tool`**
+- Matching is case-insensitive; it used to fail silently on `divamegamix`.
+- Exit code 2 when `--unmute` / `--mute` matched no session (plus a hint), so the tool no
+  longer claims success when the game was simply not running.
+- Device names are UTF-8; `PropVariantClear` runs for **any** variant type; a device
+  header is always printed (a failed `GetId` used to hide it and misfile the sessions).
+- Checks `EnumAudioEndpoints` / `GetSessionEnumerator` / `GetCount` instead of assuming
+  success; missing arguments and unknown flags are usage errors; `pid 0` (system sounds)
+  is never muted by a pattern.
+- The report is written next to the exe instead of the current directory.
+- Access-denied processes show `(denied)` instead of `(gone)`.
+
 ---
 
 ## [13.0] — 2026-10-17
