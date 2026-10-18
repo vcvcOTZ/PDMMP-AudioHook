@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.9-informational)
+![Version](https://img.shields.io/badge/version-v13.10-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -147,7 +147,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.9` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.10` and `MODE: v13 takeover`.
 
 ---
 
@@ -429,11 +429,11 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 ## Known limitations
 
 - **WASAPI exclusive is load-sensitive.** A clean standalone probe can reach ~99.5 % of real time, but inside the game it typically delivers ~94.5 %, and CPU-heavy background apps drag it lower still; some devices (an onboard codec) never move their clock (~0.3 %). The backend self-tests and falls back; it is not the default and not a recommended path.
-- **The exclusive self-test runs on the game's init thread**, so `output = excl` adds ~2.2 s to the first audio initialisation (200 ms clock ramp-up skip + 2 s measurement). Acceptable for an experiment; not used by default.
+- **The exclusive self-test runs on the watchdog thread** (since v13.10), overlapped with playback, so `output = excl` no longer delays the game's audio initialisation — it used to add ~2.2 s (200 ms clock ramp-up skip + 2 s measurement) on the game's init thread. Its window is measured against real elapsed time and the verdict lands within the first few seconds of playback.
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.
-- **No more spurious ASIO rollback:** the `asio` backend no longer rolls back to `shared` at song/stream transitions (fixed in v13.9 by an underrun grace window plus a producer-idle guard); the ring discard still racing the consumer thread remains a documented, unchanged limitation.
+- **No more spurious ASIO rollback:** the `asio` backend no longer rolls back to `shared` at song/stream transitions (fixed in v13.9 by an underrun grace window plus a producer-idle guard), and the ring discard that used to race the consumer thread was closed in v13.10 — the read cursor is published with a compare-exchange, so a discard can never be undone by an in-flight read.
 
 ---
 

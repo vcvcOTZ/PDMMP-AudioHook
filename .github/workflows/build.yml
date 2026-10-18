@@ -44,6 +44,18 @@ jobs:
             src/excl_rate_probe.exe
             src/session_tool.exe
 
+      - name: Package the mod folder
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # Ship the freshly built DLL inside the mod folder, then zip the folder
+          # (keeping the "Audio Hook" top-level dir) so the asset matches the
+          # AudioHook-v<tag>.zip packages published with every release.
+          $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+          Copy-Item src/audio_hook.dll "mods/Audio Hook/audio_hook.dll" -Force
+          Compress-Archive -Path "mods/Audio Hook" -DestinationPath "AudioHook-$tag.zip" -Force
+          Write-Host "packaged AudioHook-$tag.zip"
+
       - name: Extract release notes for this tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -76,4 +88,5 @@ jobs:
             src/asio_list.exe
             src/excl_rate_probe.exe
             src/session_tool.exe
+            AudioHook-*.zip
           body_path: RELEASE_NOTES.md

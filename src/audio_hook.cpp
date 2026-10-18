@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.9 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.10 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -74,7 +74,6 @@ static int  g_outMode = 0;       /* 0 = ASIO, 1 = WASAPI exclusive, 2 = WASAPI s
 static volatile LONG g_woState = 0;   /* 0=off 2=starting 3=running 4=failed */
 static volatile LONG g_woReading = 0; /* WoThread is actively consuming the ring */
 static volatile LONG g_woFault = 0;   /* WoThread hit a dead device and bailed out */
-static volatile LONG g_woSelftest = 0;/* exclusive self-test running: fill silence to keep the clock moving */
 static volatile LONG g_woExclusive = 0; /* WoThread drives the exclusive backend (enables MMCSS) */
 static int g_exclPeriodMs = 0;          /* excl_period_ms: 0 = device default (10 ms), else force N ms */
 static volatile LONG g_woUnder = 0;
@@ -85,6 +84,7 @@ static volatile LONG g_timerPeriod = 0;  /* timeBeginPeriod(1) is in effect */
 
 static volatile LONG g_initCalls = 0;
 static volatile LONG g_rcCalls   = 0;
+static volatile LONG g_rcFail    = 0;   /* throttles the render-client failure logs */
 
 static LARGE_INTEGER g_qpcFreq, g_qpc0;
 
@@ -380,13 +380,23 @@ static unsigned RingRead(short* dst, unsigned want)
     memcpy(dst, g_ring + (size_t)idx * 2, (size_t)first * 4);
     if (n > first) memcpy(dst + (size_t)first * 2, g_ring, (size_t)(n - first) * 4);
     MemoryBarrier();
-    g_rr = r + n;
+    /* Publish the new read cursor only if nobody discarded in the meantime. While
+       these frames were being copied, RingResyncToLatest() (Fake_Stop/Fake_Reset,
+       i.e. CRI's thread) may have moved g_rr forward to drop stale audio; a plain
+       `g_rr = r + n` then put the cursor BACK and re-handed the frames the discard
+       had just thrown away - a burst of the previous song. A lost CAS only means
+       this read is not published; the frames copied above were legitimately read
+       and are still given to the device. */
+    InterlockedCompareExchange64(&g_rr, r + (LONG64)n, r);
     InterlockedExchangeAdd64(&g_fakePlayed, (LONG64)n);   /* consumed == played */
     return n;
 }
 
 static void RingResyncToLatest(unsigned keep)
 {
+    /* Runs on CRI's thread while a consumer may be inside RingRead() - which is
+       safe only because RingRead() publishes g_rr with a compare-exchange, so a
+       discard can never be undone by an in-flight read. */
     LONG64 w = g_rw;
     LONG64 r = w - (LONG64)keep;
     if (r < 0) r = 0;
@@ -403,6 +413,36 @@ static long           g_ablock = 0;
 static int            g_apostOut = 0;
 static short*         g_tmp = NULL;      /* block*2 shorts staging (interleaved) */
 static long           g_tmpBlock = 0;    /* block size g_tmp was sized for */
+
+/* ---- drift instrumentation: the driver's own frame counter (ASIO only) ----
+ * timeInfo.samplePosition is where the driver says it is in its own sample
+ * timeline; it advances by one block per callback, i.e. it counts what the
+ * hardware really played. Comparing it against what we handed over splits the
+ * two failure modes the ring counters cannot see:
+ *   posDelta - delivered : frames the device played while we gave it nothing
+ *                          (the ring was short and WoFill padded silence) - a
+ *                          real audible gap, invisible to RingAvail() because
+ *                          the ring is legitimately empty either way,
+ *   posTotal / wall time : the device's true rate, i.e. its crystal against the
+ *                          wall clock - what shifts the game's whole timeline
+ *                          (fake clock, chart) against real time even when
+ *                          nothing is ever starved.
+ * Only the realtime callback accumulates (integers, no logging - see AsioFill);
+ * the monitor thread prints and never writes. */
+static LONG64 g_asioPosLast  = 0;          /* touched only by the realtime callback */
+static volatile LONG   g_asioHavePos  = 0; /* a baseline exists (2nd callback onwards) */
+static volatile LONG64 g_asioPosTotal = 0; /* S(posDelta) = device frames played */
+static volatile LONG64 g_asioShort    = 0; /* S(posDelta - delivered) = silence we fed */
+static volatile LONG   g_asioTimeInfo = 0; /* driver really provides samplePosition */
+static volatile LONG64 g_asioPlay0    = 0; /* g_fakePlayed at the baseline callback */
+static volatile LONG64 g_asioT0Qpc    = 0; /* QPC at the baseline callback */
+
+/* asiosys.h sets NATIVE_INT64 to 0, so ASIOSamples is the {hi,lo} struct and has
+   to be pasted back together by hand (a plain cast would read only `hi`). */
+static LONG64 AsioSamples64(const ASIOSamples& s)
+{
+    return ((LONG64)s.hi << 32) | (LONG64)s.lo;
+}
 
 /*  v11 FIX: src is INTERLEAVED stereo (L0,R0,L1,R1,...). Each ASIO channel
  *  must take src[i*2 + ch], not src[i]. The v10 code copied the interleaved
@@ -493,8 +533,12 @@ static void FakePoke(void);   /* v13, defined in the fake-client section */
 static BOOL WoStart(int exclusive);   /* v13, defined in the WASAPI-output section */
 static void WoShutdown(void);         /* v13, defined in the WASAPI-output section */
 static void RsFlush(void);            /* v13.3, drop buffered resampler frames */
+/* CRI's thread only REQUESTS a resampler flush; WoThread - the single owner of the
+   resampler state - applies it at the top of its loop. Calling RsFlush() straight
+   from Fake_Stop/Fake_Reset ran concurrently with RsPull and could emit a click. */
+static volatile LONG g_rsFlushReq = 0;
 
-static void AsioFill(long index)
+static void AsioFill(long index, const ASIOTime* ti)
 {
     InterlockedIncrement(&g_asioBusy);   /* teardown waits for this to reach 0 */
     InterlockedIncrement(&g_asoCbs);
@@ -524,6 +568,41 @@ static void AsioFill(long index)
         InterlockedIncrement(&g_underruns);
     for (int c = 0; c < 2; c++)
         WriteSamples(g_abufs[c].buffers[index], g_aci[c].type, c, g_tmp, got, (unsigned)blk);
+    /* Drift, from the driver's own frame counter (see g_asioPosTotal). Integer
+       math only, no logging: this is the realtime callback. A delta outside a
+       plausible buffer length means the driver resynced, so it is not
+       accumulated - but the baseline is still moved to the new position. */
+    if (ti && (ti->timeInfo.flags & kSamplePositionValid))
+    {
+        InterlockedExchange(&g_asioTimeInfo, 1);
+        LONG64 pos = AsioSamples64(ti->timeInfo.samplePosition);
+        if (g_asioHavePos)
+        {
+            LONG64 d = pos - g_asioPosLast;
+            if (d >= 0 && d <= (LONG64)blk * 8)
+            {
+                InterlockedExchangeAdd64(&g_asioPosTotal, d);
+                InterlockedExchangeAdd64(&g_asioShort, d - (LONG64)got);
+            }
+        }
+        else
+        {
+            /* Baseline. Both counters have to start counting from THIS callback,
+               or the two rates and the gap are not measured over the same window:
+               the first version timed the wall clock from before start(), which
+               added a fixed ~100-frame offset that read as -780 ppm at 3 s and
+               only faded as 1/t, and it took g_fakePlayed as-is, which still
+               carried the frames the pre-ASIO drain had thrown away (~13.5k
+               frames -> a bogus +105,000 ppm "game" rate, field data 20:57).
+               QueryPerformanceCounter is lock-free and RT-safe (no I/O, no
+               allocation, no logging), so it is fine here. */
+            LARGE_INTEGER c; QueryPerformanceCounter(&c);
+            g_asioPlay0 = (LONG64)g_fakePlayed;
+            g_asioT0Qpc = (LONG64)c.QuadPart;
+            InterlockedExchange(&g_asioHavePos, 1);
+        }
+        g_asioPosLast = pos;
+    }
     if (g_apostOut && g_asio) g_asio->outputReady();
     FakePoke();   /* v13: top up CRI's fake client from the real output clock */
     InterlockedDecrement(&g_asioBusy);
@@ -532,12 +611,13 @@ static void AsioFill(long index)
 static ASIOTime* cbBufferSwitchTimeInfo(ASIOTime* params, long index, ASIOBool direct)
 {
     (void)direct;
-    if (params && (params->timeInfo.flags & kSamplePositionValid)) { /* not used */ }
-    AsioFill(index);
+    /* params carries the driver's samplePosition - the only device-side truth
+       available on this path (see g_asioPosTotal). */
+    AsioFill(index, params);
     return params;
 }
 
-static void cbBufferSwitch(long index, ASIOBool direct) { (void)direct; AsioFill(index); }
+static void cbBufferSwitch(long index, ASIOBool direct) { (void)direct; AsioFill(index, NULL); }
 static void cbSampleRateDidChange(ASIOSampleRate r) { (void)r; }
 
 static long cbAsioMessage(long selector, long value, void* msg, double* opt)
@@ -1001,6 +1081,13 @@ static DWORD WINAPI AsioStartThread(LPVOID)
        both outputs (audit R1). Stop the shared stream first. */
     if (g_woState == 3) WoShutdown();
 
+    /* Drift baselines (see g_asioPosTotal): reset per session so the averages the
+       monitor prints start with THIS stream, not with an earlier one. */
+    InterlockedExchange(&g_asioHavePos, 0);
+    InterlockedExchange64(&g_asioPosTotal, 0);
+    InterlockedExchange64(&g_asioShort, 0);
+    InterlockedExchange(&g_asioTimeInfo, 0);
+
     if (g_asio->start() != ASE_OK)
     {
         Log("[asio] !! start failed");
@@ -1051,8 +1138,36 @@ static DWORD WINAPI AsioStartThread(LPVOID)
             lastOvl = g_overloads;
         }
         if (i <= 20 || (i % 60) == 0)
+        {
             Log("[asio] t=%llds cbs=%ld und=%ld avail=%u zeroTap=%ld muted=%ld",
                 i, g_asoCbs, g_underruns, RingAvail(), g_zeroTap, g_muted);
+            /* Drift (see g_asioPosTotal). Cumulative averages, not per-second
+               deltas: a crystal error only shows up over a long window. `dev` is
+               the hardware rate against the wall clock, `game` is the rate the
+               game's own clock (fake clock == frames we delivered) advances at,
+               and `gap` is the frames the device played while we handed it
+               nothing. dev == game + gap, so a non-zero gap is audible dropout
+               and dev != game is the timeline drift against the chart. */
+            /* Both counters are measured from the baseline callback the callback
+               thread stamped (see g_asioT0Qpc), so dev - game == gap exactly and
+               the ppm is honest from the first second - not just after a minute. */
+            LARGE_INTEGER nowc; QueryPerformanceCounter(&nowc);
+            double el = (double)(nowc.QuadPart - g_asioT0Qpc) / (double)g_qpcFreq.QuadPart;
+            LONG64 pos = (LONG64)g_asioPosTotal;
+            LONG64 play = (LONG64)g_fakePlayed - g_asioPlay0;
+            LONG64 gap = (LONG64)g_asioShort;
+            if (!g_asioTimeInfo)
+            {
+                if (i == 20)
+                    Log("[asio] drift: this driver reports no samplePosition - device-side "
+                        "drift unavailable, the ring counters are all there is");
+            }
+            else if (g_asioHavePos && el >= 1.0)
+                Log("[asio] drift: dev=%.1f fr/s (%+.0f ppm) game=%.1f fr/s (%+.0f ppm) gap=%lld fr (%.2f ms/s avg)",
+                    (double)pos / el, ((double)pos / el - 44100.0) * 1e6 / 44100.0,
+                    (double)play / el, ((double)play / el - 44100.0) * 1e6 / 44100.0,
+                    (long long)gap, (double)gap / el * 1000.0 / 44100.0);
+        }
     }
     return 0;
 }
@@ -1071,8 +1186,15 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_GetBuffer(void* self, UINT32 frames, BY
         Log("[rc] GetBuffer(%u fr) hr=0x%08X %s", frames, (unsigned)hr, HrBrief(hr));
     if (FAILED(hr))
     {
-        Log("[rc] !! GetBuffer(%u fr) FAILED hr=0x%08X from exe+0x%llX", frames, (unsigned)hr,
-            (unsigned long long)((UINT_PTR)ra - (UINT_PTR)GetModuleHandleA(NULL)));
+        /* Throttled: once the device is gone EVERY call fails, and Log() fflushes
+           each line - that is a lot of disk I/O on CRI's mixing thread exactly
+           when the pipe is already in trouble (it used to write the same line
+           thousands of times a second). */
+        LONG f = InterlockedIncrement(&g_rcFail);
+        if (f <= 8 || (f % 500) == 0)
+            Log("[rc] !! GetBuffer(%u fr) FAILED hr=0x%08X from exe+0x%llX (failure #%ld)",
+                frames, (unsigned)hr,
+                (unsigned long long)((UINT_PTR)ra - (UINT_PTR)GetModuleHandleA(NULL)), f);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED && g_asioState >= 2) InterlockedExchange(&g_kicked, 1);
     }
 
@@ -1132,6 +1254,14 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_ReleaseBuffer(void* self, UINT32 frames
             }
             else n = 0;
             InterlockedExchangeAdd64(&g_tapFrames, (LONG64)n);
+            /* Empty the slot again. `ptr` is the gate the next ReleaseBuffer checks,
+               so a stale address left in it would let a release with no matching
+               GetBuffer (a seek/restart, or a GetBuffer that failed) re-inject the
+               previous block into the ring - an audible repeat. Length first,
+               pointer last, mirroring Hook_RC_GetBuffer. */
+            g_rcSlots[si].frames = 0;
+            MemoryBarrier();
+            g_rcSlots[si].ptr = NULL;
         }
     }
 
@@ -1141,8 +1271,11 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_ReleaseBuffer(void* self, UINT32 frames
         Log("[rc] ReleaseBuffer(%u fr, flags=0x%X) hr=0x%08X", frames, (unsigned)flags, (unsigned)hr);
     if (FAILED(hr))
     {
-        Log("[rc] !! ReleaseBuffer(%u fr) FAILED hr=0x%08X from exe+0x%llX", frames, (unsigned)hr,
-            (unsigned long long)((UINT_PTR)ra - (UINT_PTR)GetModuleHandleA(NULL)));
+        LONG f = InterlockedIncrement(&g_rcFail);   /* throttled, see GetBuffer */
+        if (f <= 8 || (f % 500) == 0)
+            Log("[rc] !! ReleaseBuffer(%u fr) FAILED hr=0x%08X from exe+0x%llX (failure #%ld)",
+                frames, (unsigned)hr,
+                (unsigned long long)((UINT_PTR)ra - (UINT_PTR)GetModuleHandleA(NULL)), f);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED && g_asioState >= 2) InterlockedExchange(&g_kicked, 1);
     }
     return hr;
@@ -1438,15 +1571,28 @@ static DWORD WINAPI FakeDriverThread(LPVOID)
             Sleep(2);
             continue;
         }
-        /* nothing running and nothing starting: drain at real time so CRI keeps
-           a sane clock and the game never stalls on a full queue */
+        /* Nothing running and nothing starting: drain at real time so CRI keeps a
+           sane clock and the game never stalls on a full queue.
+
+           How much to drain MUST come from the elapsed wall clock, not from a
+           fixed chunk. RingRead() advances the fake clock (g_fakePlayed) that CRI
+           reads as "played" and the game syncs its chart to, so the old fixed
+           220-frame-per-Sleep(5) loop ran ~9 % slow: the whole timeline - music
+           and chart alike - dragged behind real time for as long as no output
+           backend was up, and for the rest of the session whenever every backend
+           had failed. Consuming exactly what elapsed time owes pins the drain
+           rate, and with it the clock, at 44,100 fr/s. */
+        double t0 = MsNow();
         Sleep(5);
+        unsigned want = (unsigned)((MsNow() - t0) * 44.1);   /* elapsed ms -> 44,100 fr/s */
+        if (want > FAKE_CHUNK) want = FAKE_CHUNK;            /* tmp[] holds FAKE_CHUNK frames */
         unsigned a = RingAvail();
-        unsigned n = a >= FAKE_CHUNK ? FAKE_CHUNK / 2 : a;
-        /* tmp must hold `n` stereo frames. RingAvail() is capped at FAKE_FRAMES
-           by FakeRC::GetBuffer's back-pressure, so n is at most FAKE_CHUNK-1 =
-           440 frames (880 shorts). The old tmp[512] (256 frames) overflowed
-           whenever CRI handed us a 257..440-frame chunk (e.g. a partial fill). */
+        unsigned n = a < want ? a : want;
+        /* tmp must hold `n` stereo frames. FakeRC::GetBuffer's back-pressure caps
+           RingAvail() at FAKE_RING (480), and the clamp above caps `want` at
+           FAKE_CHUNK (441), so n <= 441 frames = 882 shorts: tmp[FAKE_CHUNK*2] is
+           exactly enough. The old tmp[512] (256 frames) overflowed whenever CRI
+           handed us a 257..440-frame chunk (e.g. a partial fill). */
         if (n) { static short tmp[FAKE_CHUNK * 2]; RingRead(tmp, n); }
         FakePoke();
     }
@@ -1499,16 +1645,49 @@ static HRESULT STDMETHODCALLTYPE Fake_GetDevicePeriod(IAudioClient* s, REFERENCE
     if (FakeIsSelf(s)) { if (def) *def = 100000; if (mn) *mn = 30000; return S_OK; }
     return oGDP ? oGDP(s, def, mn) : E_FAIL;
 }
+/* The fake driver thread exits only after it observes g_fake.running == 0, and
+   it can be asleep in up to 20 ms of Sleep() when Fake_Stop clears that flag.
+   Keeping its handle (instead of closing it inside Fake_Start) is what makes a
+   fast Stop -> Start safe: the old code set the flag straight back to 1, the
+   sleeping thread then woke up, saw 1 and kept looping, and TWO drain threads
+   consumed the same ring at once (chopped, half-speed audio). Now the previous
+   thread is joined first; if it is still inside its loop it simply gets the flag
+   back - it *is* the driver thread this Start wants, so no second one is made. */
+static HANDLE g_fakeThread = NULL;
+
 static HRESULT STDMETHODCALLTYPE Fake_Start(IAudioClient* s)
 {
     if (FakeIsSelf(s))
     {
-        if (InterlockedExchange(&g_fake.running, 1) == 0)
+        BOOL reuse = FALSE;
+        if (g_fakeThread)
         {
-            InterlockedExchange64(&g_fakeStateTick, (LONG64)GetTickCount64());
+            if (WaitForSingleObject(g_fakeThread, 200) == WAIT_OBJECT_0)
+            {
+                CloseHandle(g_fakeThread);   /* it left its loop: reap it */
+                g_fakeThread = NULL;
+            }
+            else
+                reuse = TRUE;                /* still looping: it will pick the flag up */
+        }
+        InterlockedExchange(&g_fake.running, 1);
+        InterlockedExchange64(&g_fakeStateTick, (LONG64)GetTickCount64());
+        /* The thread may have left between that timeout and the flag flip; a
+           thread handle stays signalled once its thread ends, so this re-check
+           is what keeps "reuse" from meaning "no driver thread at all". */
+        if (reuse && WaitForSingleObject(g_fakeThread, 0) == WAIT_OBJECT_0)
+        {
+            CloseHandle(g_fakeThread);
+            g_fakeThread = NULL;
+            reuse = FALSE;
+        }
+        if (reuse)
+            Log("[fake] Start() -> previous driver thread still alive, reusing it");
+        else
+        {
             HANDLE t = CreateThread(NULL, 0, FakeDriverThread, NULL, 0, NULL);
-            if (t) CloseHandle(t); else InterlockedExchange(&g_fake.running, 0);
-            Log("[fake] Start() -> driver launched");
+            if (t) { g_fakeThread = t; Log("[fake] Start() -> driver launched"); }
+            else { InterlockedExchange(&g_fake.running, 0); Log("[fake] !! driver thread create failed"); }
         }
         return S_OK;
     }
@@ -1521,7 +1700,8 @@ static HRESULT STDMETHODCALLTYPE Fake_Stop(IAudioClient* s)
         InterlockedExchange(&g_fake.running, 0);
         InterlockedExchange64(&g_fakeStateTick, (LONG64)GetTickCount64());
         RingResyncToLatest(0);   /* the next song must not start with old audio */
-        RsFlush();               /* ...including the resampler's own 441 frames */
+        InterlockedExchange(&g_rsFlushReq, 1);   /* ...including the resampler's own
+                                                    441 frames (WoThread applies it) */
         Log("[fake] Stop()");
         return S_OK;
     }
@@ -1536,7 +1716,7 @@ static HRESULT STDMETHODCALLTYPE Fake_Reset(IAudioClient* s)
            Start/Stop stamps left open: a seek / restart discards without Stop). */
         InterlockedExchange64(&g_fakeStateTick, (LONG64)GetTickCount64());
         RingResyncToLatest(0);   /* restart/seek: drop up to 10 ms of stale audio */
-        RsFlush();
+        InterlockedExchange(&g_rsFlushReq, 1);   /* ...and the resampler's buffer */
         return S_OK;
     }
     return oReset ? oReset(s) : E_FAIL;
@@ -1620,7 +1800,7 @@ static int                 g_woFloat  = 0;
 static int                 g_woCh     = 2;   /* output channel count */
 static volatile LONG       g_woRun    = 0;
 static volatile LONG       g_woAlive  = 0;   /* WoThread is inside its loop */
-static IAudioClock*        g_woClock  = NULL; /* exclusive: real device clock (drift tracking) */
+static IAudioClock*        g_woClock  = NULL; /* exclusive: real device clock (self-test only) */
 static UINT64              g_woClockFreq = 0; /* IAudioClock::GetFrequency() (clock units/s) */
 
 /* ---- resampler (only active when the endpoint is not 44.1 kHz) ----
@@ -1629,8 +1809,8 @@ static UINT64              g_woClockFreq = 0; /* IAudioClock::GetFrequency() (cl
  * because only the ASIO path had a sample-rate guard. Linear interpolation is
  * plenty for such a small ratio and costs one frame of latency. */
 static double g_rsStep = 1.0;          /* source frames per output frame */
-static double g_rsLastMs = 0.0;        /* exclusive drift tracker: last sample time (MsNow) */
-static UINT64 g_rsLastPos = 0;         /* exclusive drift tracker: last device-clock position */
+static double g_rsLastMs = 0.0;        /* tempo monitor: last sample time (MsNow) */
+static UINT64 g_rsLastPos = 0;         /* tempo monitor: last fake-clock position */
 static double g_rsFrac = 0.0;
 static short  g_rsCur[2] = { 0, 0 };
 static short  g_rsNext[2] = { 0, 0 };
@@ -1795,6 +1975,13 @@ static DWORD WINAPI WoThread(LPVOID)
     int nopulse = 0, faults = 0;
     while (g_woRun)
     {
+        /* A flush requested by Fake_Stop/Fake_Reset is applied HERE, on the only
+           thread that owns the resampler state: RsFlush() wipes g_rsCur/g_rsNext/
+           g_rsBuf/g_rsI/g_rsN, and calling it from CRI's thread while RsPull below
+           was mid-sample tore that state (an audible click). One loop iteration of
+           delay is invisible - all that matters is that the previous song's tail is
+           gone before the next one starts playing. */
+        if (InterlockedExchange(&g_rsFlushReq, 0)) RsFlush();
         DWORD w = WaitForSingleObject(g_woEvent, 200);
         if (!g_woRun) break;
         if (w != WAIT_OBJECT_0)
@@ -1846,20 +2033,22 @@ static DWORD WINAPI WoThread(LPVOID)
             avail = avail > 2 ? avail - 2 : 0;
         }
         UINT32 n = free_ < avail ? free_ : avail;
-        /* Exclusive + EVENTCALLBACK has no engine buffer of its own: if its single
-           period ever runs completely dry the device stops firing events, the
-           writer waits forever and the whole pipe deadlocks - the ring fills, CRI
-           blocks, the game stays silent and never exits (the "silent on the second
-           launch / alt+F4 hangs" report). So the exclusive backend must never be
-           handed nothing: pad one period of silence to keep the clock alive. */
-        if (g_woExclusive && n == 0) n = free_;
-        /* During the exclusive self-test the game has not started mixing yet, so
-           the ring is empty and `n` would be 0 -> nothing written -> the device
-           has no data -> its clock never advances -> the self-test reads 0 % (a
-           false negative). Fill silence to keep the clock moving so the test
-           measures the real delivery rate (WoFill16/WoFillFloat already pad
-           with zeros when the ring is dry). */
-        if (!n && g_woSelftest) n = free_;
+        /* Exclusive + EVENTCALLBACK has no engine buffer of its own: its single
+           period must be filled COMPLETELY on every event. Handing it a partial
+           fill - what `min(free_, avail)` above does, with a full period only
+           when n happened to be exactly 0 - leaves the rest of the period holding
+           frames the device already played and lets the queue drain until the
+           device stops firing events; the writer then waits forever and the whole
+           pipe deadlocks: the ring fills, CRI blocks, the game stays silent and
+           never exits (the "silent on the second launch / alt+F4 hangs" report).
+           A ring that is merely *short* (a CRI partial fill around a song change)
+           triggered exactly that, once per transition. Pad the shortfall with
+           silence instead - WoFill16/WoFillFloat already zero the tail - so the
+           device always has a whole period to chew on. That also covers the
+           startup window: before CRI starts mixing the ring is empty, n would be 0
+           and nothing at all would reach the device (the false 0 % self-test
+           reading, and a device that stops firing events). */
+        if (g_woExclusive) n = free_;
         if (n)
         {
             BYTE* p = NULL;
@@ -2019,8 +2208,15 @@ static BOOL WoInit(int exclusive)
         if (g_exclPeriodMs > 0)
         {
             /* period-relaxation switch (excl_period_ms): a larger exclusive period
-               gives the event loop more lookahead, which is exactly what the in-game
-               load was eating (measured 10 ms ~94.5 %, 20 ms ~98 %). 0 = device default. */
+               gives the event loop more lookahead, which is what the in-game load
+               was eating (measured 10 ms ~94.5 %, 20 ms ~98 %). 0 = device default.
+               Field data also says the opposite on some devices - a NON-default
+               period made the endpoint stop firing events altogether, and that is
+               the one failure which deadlocks the writer (see the never-starve fill
+               in WoThread) - so say so instead of letting the knob look free. */
+            Log("[wo] !! excl_period_ms=%d: a non-default exclusive period has been seen to stop "
+                "event delivery on some devices; 0 (device default) is the safe setting",
+                g_exclPeriodMs);
             REFERENCE_TIME want = (REFERENCE_TIME)g_exclPeriodMs * 10000;
             if (want < mn) want = mn;
             if (want > 1000000) want = 1000000;   /* cap at 100 ms */
@@ -2049,8 +2245,10 @@ static BOOL WoInit(int exclusive)
 
     if (exclusive)
     {
-        /* The device's own clock drives the drift tracker (see WoStart/WoThread).
-           GetFrequency() normalises its units, so the rate is read in frames/s
+        /* Opened for the exclusive self-test, which reads the device's own position
+           as a second opinion on the delivered rate; the steady-state tempo monitor
+           in WoThread follows the fake clock instead, so nothing else reads it.
+           GetFrequency() normalises its units, so the rate comes out in frames/s
            even on a driver whose clock does not tick in samples. */
         g_woClockFreq = 0;
         if (SUCCEEDED(g_woClient->GetService(__uuidof(IAudioClock), (void**)&g_woClock)) && g_woClock)
@@ -2061,7 +2259,7 @@ static BOOL WoInit(int exclusive)
         else
         {
             g_woClock = NULL;
-            Log("[wo] !! no IAudioClock - exclusive drift tracking disabled");
+            Log("[wo] !! no IAudioClock - the exclusive self-test falls back to the written rate");
         }
     }
 
@@ -2083,7 +2281,7 @@ static BOOL WoInit(int exclusive)
     g_woCh = wf->nChannels;
     RsReset();
     g_rsStep = 44100.0 / (double)rate;     /* 1.0 on a 44.1 kHz endpoint */
-    g_rsLastMs = 0.0;                      /* drift tracker re-baselines on the next loop */
+    g_rsLastMs = 0.0;                      /* tempo monitor re-baselines on the next loop */
     Log("[wo] ready: %s %u Hz / %u bit / %u ch tag=0x%X, buffer=%u fr (%.2f ms) resample=%s",
         exclusive ? "EXCLUSIVE" : "SHARED", wf->nSamplesPerSec, wf->wBitsPerSample, wf->nChannels,
         wf->wFormatTag, g_woFrames, g_woFrames * 1000.0 / (double)rate,
@@ -2127,14 +2325,11 @@ static void WoShutdown(void)
     InterlockedExchange(&g_woState, 0);
 }
 
-/* Init + start. exclusive==1 -> exclusive, else shared.
-   Exclusive runs a self-test (skip the clock ramp-up, then measure 2 s) and
-   rolls back to shared when the measured rate lands under 90 % of 44,100.
-   The reading is a truthiness check only: on a healthy device it lands in a
-   93.5-98.5 % band and does NOT converge to 100 % even at 5 s, so it is a
-   self-test-phase transient, not a real delivery rate. Sessions that pass it
-   run stably; the 90 % bar still rejects dead/paused devices (0 %). Never
-   feed this reading to the resample step - see the NOTE in the block below. */
+/* Init + start. exclusive==1 -> exclusive, else shared. Returns as soon as the
+   stream is actually running; the exclusive gate (a ~2 s self-test, rollback to
+   shared when the device turns out to be dead) runs asynchronously from
+   WatchdogThread - see ExclSelfTestTick. Never calibrate the resample step from
+   that reading: step stays at its format-derived value (44100 / device rate). */
 static BOOL WoStart(int exclusive)
 {
     /* ASIO and the WASAPI backend must never run at once: both read the same
@@ -2194,82 +2389,11 @@ static BOOL WoStart(int exclusive)
         return FALSE;
     }
 
-    if (exclusive)
-    {
-        UINT64 c0 = 0, c1 = 0;
-        BOOL haveClk = FALSE;
-        const double clkScale = (g_woClockFreq > 0) ? (44100.0 / (double)g_woClockFreq) : 1.0;
-        if (g_woClock && SUCCEEDED(g_woClock->GetPosition(&c0, NULL)))
-            haveClk = TRUE;
-
-        /* The reading is a coarse TRUTHINESS check, not a health metric. Two
-           false-failure modes to avoid: (1) an empty ring before the game starts
-           mixing (~2.5 s in) means nothing is written and the clock never moves
-           -> 0 %; flag the writer to fill silence so the clock keeps advancing,
-           and skip the initial clock ramp. (2) Window length does NOT converge
-           the reading: on this device it lands in a 93.5-98.5 % band at 2 s and
-           STILL reads 94.2 % at 5 s (field data, 18:28), so the sub-100 % value
-           is a self-test-phase transient, not a fixed startup offset (a fixed
-           offset would have vanished at 5 s). Empirically every session that
-           passed this gate then ran stably; only truly dead ones read 0 %.
-           Hence the bar sits at 90 % - it rejects dead/paused devices, admits
-           healthy ones, and the steady-state tempo monitor in WoThread (the
-           real validator) reports the truth either way. Never calibrate the
-           resample step from this reading - see the NOTE below. */
-        InterlockedExchange(&g_woSelftest, 1);
-        Sleep(200);
-        if (haveClk) g_woClock->GetPosition(&c0, NULL);
-        LONG64 out0 = (LONG64)g_woOut;
-
-        /* 2 s window (was 5 s). The 5 s window bought nothing: the reading does
-           not converge with window length, and it delayed the game's audio by 3
-           extra seconds (the self-test runs on the game's init thread, so the
-           title screen came up silent for that whole stretch). 2 s is enough
-           for the 90 % gate. One-off startup cost: 200 ms + 2 s. */
-        Sleep(2000);
-
-        LONG64 out = (LONG64)g_woOut - out0;
-        double outRate = (double)out / 2.0;
-        double clkRate = 0.0;
-        if (haveClk && SUCCEEDED(g_woClock->GetPosition(&c1, NULL)))
-            clkRate = (double)(c1 - c0) / 2.0 * clkScale;   /* clock units/s -> frames/s */
-        InterlockedExchange(&g_woSelftest, 0);
-
-        double rate = outRate;
-        if (haveClk && clkRate > 0.0 && clkRate < rate) rate = clkRate;  /* the honest one */
-        Log("[wo] exclusive self-test: written=%.0f fr/s clock=%.0f fr/s -> %.1f%% of 44100",
-            outRate, clkRate, 100.0 * rate / 44100.0);
-
-        if (rate < 44100.0 * 0.90)
-        {
-            Log("[wo] !! exclusive self-test FAILED (%.1f%%) - rolling back",
-                100.0 * rate / 44100.0);
-            WoShutdown();
-            InterlockedExchange(&g_woCbs, 0);
-            InterlockedExchange(&g_woUnder, 0);
-            return FALSE;
-        }
-        Log("[wo] exclusive self-test OK (%.1f%%)", 100.0 * rate / 44100.0);
-
-        /* The counters above were inflated by the self-test's silence fill (the
-           ring is empty, so WoFill pads zeros) - reset them for playback. */
-        InterlockedExchange(&g_woCbs, 0);
-        InterlockedExchange(&g_woUnder, 0);
-
-        /* NOTE: this used to calibrate the resample step from the measured rate
-           ("device=42093 fr/s -> step=1.04768"). Wrong twice over. (1) An
-           exclusive endpoint's IAudioClock is the DAC's read cursor, crystal
-           locked to the negotiated rate - it cannot run at 95 %. The sub-100 %
-           reading is a fixed startup offset divided by the window (100-300 ms
-           over 2 s = the 93.5-98.5 % run-to-run noise band; over 5 s the same
-           offset reads ~99.3 %+). (2) Calibrating step > 1 from it starves the
-           single-period buffer by (1 - 1/step): production stays 44,100 fr/s,
-           the writer can only feed 44,100/step, so the device replays stale
-           frames every period - the audible timeline pauses during each replay
-           while the fake clock (and the chart) keep tempo, i.e. the offset
-           grows ~1.7 s/min and every period clicks. step stays at its
-           format-derived value (44100 / negotiated device rate). */
-    }
+    /* The exclusive self-test used to run right here - 200 ms of ramp plus 2 s of
+       measurement, on the thread Hook_Initialize calls us from. That blocked the
+       game's audio init and left the title screen silent for 2.2 s on every launch
+       with output=excl. It now runs from WatchdogThread, overlapped with playback:
+       see ExclSelfTestTick(). WoStart() only has to bring the stream up. */
     return TRUE;
 }
 
@@ -2574,6 +2698,92 @@ static void WoWatchdog(void)
     if (!WoStart(0)) Log("[wo] !! watchdog restart failed");
 }
 
+/* --------------- exclusive self-test, run by the watchdog (v13.10) --------------
+ * It used to sit inside WoStart(), which Hook_Initialize calls on the game's init
+ * thread: 200 ms of ramp plus 2 s of measurement blocked the game's audio init, so
+ * the title screen came up silent for 2.2 s on every launch with output=excl.
+ * Running it here overlaps it with playback instead - nothing else has to know a
+ * test is in progress, because the exclusive writer already fills a whole period
+ * on every event by itself (silence for the tail), so the device clock keeps
+ * moving while this thread only samples counters. On failure the teardown happens
+ * on this thread, the same one that rebuilds a shared stream on the next tick, so
+ * the output backend is never reconfigured from two threads at once.
+ *
+ * The reading is a coarse TRUTHINESS check, not a health metric. Field data
+ * (18:28 / 18:37 in audio_hook.log): a healthy device lands in a 93.5-99.6 % band
+ * and does NOT converge to 100 % with a longer window, while a dead or paused
+ * device reads 0 % - nothing gets written at all, because its endpoint buffer
+ * stays full, GetBuffer() has no room and g_woOut stops advancing. The 90 % bar
+ * separates those two cleanly, and every session that passed it then ran stably.
+ * Never feed this number to the resample step: step stays at its format-derived
+ * value (44100 / negotiated device rate). */
+static void ExclSelfTestTick(void)
+{
+    static int       stState   = 0;   /* 0 = waiting for a stream, 1 = measuring, 2 = done */
+    static ULONGLONG stTick    = 0;
+    static LONG64    stOut0    = 0;
+    static UINT64    stClk0    = 0;
+    static BOOL      stHaveClk = FALSE;
+
+    if (stState == 0)
+    {
+        if (g_woState != 3 || !g_woExclusive) return;   /* no exclusive stream to judge */
+        stState   = 1;
+        stTick    = GetTickCount64();
+        stOut0    = (LONG64)g_woOut;
+        stHaveClk = (g_woClock && SUCCEEDED(g_woClock->GetPosition(&stClk0, NULL))) ? TRUE : FALSE;
+        Log("[wo] exclusive self-test armed (runs during playback - game init is not blocked)");
+        return;
+    }
+    if (stState != 1) return;
+
+    /* This thread wakes once a second, so the window is whatever has elapsed:
+       measure against the real time instead of assuming the old fixed 2 s. */
+    double secs = (double)(GetTickCount64() - stTick) / 1000.0;
+    if (secs < 2.0) return;
+
+    stState = 2;
+    if (g_woState != 3 || !g_woExclusive)
+    {
+        Log("[wo] exclusive self-test: stream is gone before the end of the window - no verdict");
+        return;
+    }
+
+    LONG64 out = (LONG64)g_woOut - stOut0;
+    double outRate = (double)out / secs;
+    double clkRate = 0.0;
+    if (stHaveClk && g_woClock)
+    {
+        UINT64 c1 = 0;
+        if (SUCCEEDED(g_woClock->GetPosition(&c1, NULL)))
+        {
+            const double scale = (g_woClockFreq > 0) ? (44100.0 / (double)g_woClockFreq) : 1.0;
+            clkRate = (double)(c1 - stClk0) / secs * scale;   /* clock units/s -> frames/s */
+        }
+    }
+
+    double rate = outRate;
+    if (clkRate > 0.0 && clkRate < rate) rate = clkRate;      /* the honest one */
+    Log("[wo] exclusive self-test: written=%.0f fr/s clock=%.0f fr/s over %.1fs -> %.1f%% of 44100",
+        outRate, clkRate, secs, 100.0 * rate / 44100.0);
+
+    if (rate < 44100.0 * 0.90)
+    {
+        Log("[wo] !! exclusive self-test FAILED (%.1f%%) - rolling back to shared",
+            100.0 * rate / 44100.0);
+        WoShutdown();                              /* this thread owns the teardown */
+        InterlockedExchange(&g_woState, 4);        /* next tick: WoWatchdog rebuilds shared */
+        InterlockedExchange(&g_woCbs, 0);
+        InterlockedExchange(&g_woUnder, 0);
+        return;
+    }
+    Log("[wo] exclusive self-test OK (%.1f%%)", 100.0 * rate / 44100.0);
+    /* Reset only for tidiness: these were inflated by the silence the writer had
+       to feed while the game was still not mixing, not by playback trouble. */
+    InterlockedExchange(&g_woCbs, 0);
+    InterlockedExchange(&g_woUnder, 0);
+}
+
 static DWORD WINAPI WatchdogThread(LPVOID)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -2597,6 +2807,9 @@ static DWORD WINAPI WatchdogThread(LPVOID)
                 Log("[fix] cleared stale session-mute residue (deferred)");
         }
 
+        /* The exclusive self-test comes first: if it fails it sets state 4, which
+           WoWatchdog on this very tick would otherwise have to be woken for. */
+        ExclSelfTestTick();
         WoWatchdog();
 
         if (i <= 30 || (i % 60) == 0)
@@ -2726,7 +2939,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v13.9 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.10 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");

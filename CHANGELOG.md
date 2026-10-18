@@ -3,8 +3,169 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.9`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.10`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.10] — 2026-10-18
+
+A full-file review pass, plus the first field use of a new ASIO instrument. The `asio` path
+is confirmed clean over two minutes (`und=0`, zero starvation, the device within ±22 ppm of
+the wall clock); `excl` is confirmed to be 3.7–3.9 % starved **in steady state**, not just
+during its self-test. Both items the 13.9 entry had left deferred are fixed. `asio` is still
+the recommended output.
+
+### Added — driver-side drift instrumentation (`asio`)
+
+`cbBufferSwitchTimeInfo` ignored `timeInfo.samplePosition` outright. It is the driver's own
+frame counter - the only device-side truth on this path - and it separates the two failure
+modes the ring counters cannot see:
+
+- `posDelta − delivered` = frames the **device** played while we handed it nothing. A real
+  audible gap; `RingAvail()` cannot tell it apart from a legitimately empty ring, which is
+  why it was never caught before.
+- `posTotal / wall time` = the device's true rate, i.e. its crystal against the wall clock -
+  the part that shifts the whole timeline (music and chart together) against real time even
+  when nothing is ever starved.
+
+The realtime callback only accumulates (integers, no I/O, no logging; the time origin is
+stamped there with `QueryPerformanceCounter`, which is lock-free and RT-safe). The monitor
+thread prints `[asio] drift: dev=… game=… gap=…` as cumulative averages (~2 s in, then with
+the per-minute status line). `dev − game == gap` holds exactly, so the line is
+self-checking. `ASIOSamples` is the `{hi,lo}` struct in this build (`asiosys.h` sets
+`NATIVE_INT64` to 0) and is reassembled by hand - a plain cast reads only `hi`. Drivers that
+report no `samplePosition` are detected once and said so in the log.
+
+The first cut of the instrument was wrong in a way the field run exposed: it timed the wall
+clock from before `start()`, which added a fixed ~100-frame offset to `dev` (read −783 ppm
+at 3 s and only faded as 1/t), and it read `g_fakePlayed` as-is, which still carried the
+frames the pre-ASIO drain had discarded (~13.5k, i.e. a bogus +104 818 ppm "game" rate).
+Both counters now start at the first callback that carries a `samplePosition`, so the
+reading is honest from the first second. A run whose `gap` climbs is starving the device, no
+matter what the other counters say.
+
+### Changed — the `excl` self-test runs from `WatchdogThread`
+
+It used to run inline in `WoStart()`, which `Hook_Initialize` calls on the game's init
+thread: 200 ms of ramp plus 2 s of measurement blocked audio init, so the title screen came
+up silent for 2.2 s on every launch with `output=excl`.
+
+The watchdog now arms and judges it, overlapped with playback - nothing else has to know a
+test is in progress, because the exclusive writer keeps the device fed on its own (see the
+partial-period fix below). On failure the teardown happens on the same thread that rebuilds
+`shared` on the next tick, so the backend is never reconfigured from two threads at once
+(the trap an independent self-test thread walks into: `WoInit` releases `g_woClock` from
+another thread and the reader is left with a stale pointer). The window is measured against
+real elapsed time - the watchdog wakes once a second - instead of the old fixed 2 s, and the
+new `[wo] exclusive self-test armed (runs during playback - game init is not blocked)` line
+marks the change. `g_woSelftest` is gone: forcing the silence fill was its only job, and
+exclusive now always receives a complete period.
+
+### Fixed — `excl` could be handed a *partial* period
+
+`n = min(free_, avail)`, with a full period forced only when `n` happened to be exactly 0. A
+ring that was merely *short* (a CRI partial fill around a song change) left the rest of the
+period holding frames the device had already played and let the queue drain towards the one
+state the single-period buffer cannot survive - the failure this backend already documents
+as "silent on the second launch / alt+F4 hangs". Exclusive now always requests `free_`;
+`WoFill16`/`WoFillFloat` already zero the tail, so the shortfall is silence rather than
+stale audio. This also covers the pre-mix startup window, where `n` used to be 0 and nothing
+at all reached the device.
+
+### Fixed — a fast `Fake_Stop()` → `Fake_Start()` could leave two drain threads
+
+`Fake_Start` set `g_fake.running` straight back to 1 while the previous thread was still
+asleep in up to 20 ms of `Sleep()`; it then woke, saw 1 and kept looping, and two threads
+consumed the same ring at once (chopped, half-speed audio). The thread handle is kept now:
+the old thread is joined, or simply handed the flag back when it is still inside its loop,
+with a re-check for the "left between the timeout and the flag flip" window so that "reuse"
+cannot come to mean "no driver thread at all". This closes the second item v13.9 left
+deferred.
+
+### Fixed — the idle drain paced the game clock ~9 % slow
+
+With no output backend up, `FakeDriverThread` drained a fixed 220-frame chunk per `Sleep(5)`.
+`RingRead()` advances the fake clock that CRI reads as "played" and the game syncs its chart
+to, so the whole timeline - music and chart alike - dragged behind real time for as long as
+no backend was up, and for the rest of the session whenever every backend had failed. The
+amount drained is now what the elapsed wall clock owes (44 100 fr/s, clamped to the staging
+buffer), so the drain rate, the clock and real time agree.
+
+### Fixed — a concurrent ring discard could be undone
+
+`RingRead` published `g_rr` with a plain store, while `RingResyncToLatest` - CRI's thread,
+via `Fake_Stop` / `Fake_Reset` - could move it forward mid-copy. The store then put the
+cursor *back* and re-handed frames the discard had just thrown away (a burst of the previous
+song). The publish is a compare-exchange now, so a discard always wins. This closes the
+first item v13.9 left deferred.
+
+### Fixed — smaller ones
+
+- The legacy tap left the slot's `ptr` / `frames` populated after use, so a release with no
+  matching `GetBuffer()` (a seek / restart, or a failed `GetBuffer`) could re-inject the
+  previous block into the ring - an audible repeat. The slot is emptied again, length first,
+  pointer last.
+- `RsFlush()` ran on CRI's thread while `RsPull()` was mid-sample on `WoThread`, sharing
+  `g_rsCur` / `g_rsNext` / `g_rsBuf` / `g_rsI` / `g_rsN`; a torn state emits a click. CRI now
+  only requests the flush, and `WoThread` - the single owner - applies it at the top of its
+  loop. One loop iteration of delay is invisible; the point is only that the previous song's
+  tail is gone before the next one starts.
+- The render-client failure logs were unbounded, and `Log()` `fflush`es every line: a device
+  that is gone made every call fail, so the same line was written thousands of times a
+  second on CRI's mixing thread. Front 8 failures, then every 500th.
+- `excl_period_ms` above the device default is known to stop event delivery, but the config
+  still accepted it and the code advertised it as the fix for in-game load. `WoInit` now
+  says so loudly instead.
+
+### Verified — first field run of the instruments
+
+`asio`, two minutes (block 64): **`gap=0 fr` at every sample and `und=0` end to end** - the
+device never played without data, i.e. zero starvation, and no rollback. `dev` settled at
+**−22 ppm** against the wall clock (≈1.3 ms/min), so on this device the timeline does not
+drift against real time. (The callback counter alone could not have shown this: 689 ±1
+callbacks/s quantises to ±1450 ppm.)
+
+`excl`, four measurements across two launches: self-test 96.0 % and 96.3 % `OK`, and the
+independent steady-state tempo monitor read `fake-clock=42 460 fr/s (96.28 %)`. So the
+sub-100 % self-test reading is **not** the self-test-phase transient v13.9 assumed - the
+exclusive writer genuinely services only ~96 of the 100 events per second, i.e. ~37 ms of
+silence is injected per second. With the gate at 90 % an `excl` session passes while playing
+with that dropout; tightening the gate (or retiring `excl`) is left as a decision, since
+`asio` is the recommended path.
+
+Audio init is no longer blocked: `[wo] ready: EXCLUSIVE` now arrives **83 ms** after the
+game's `Initialize` call, and the game's own log lines (stream2's `Initialize`, the fake
+render client, the heartbeat) continue straight through the window that used to stall them.
+
+### Known limitation — `excl` holds the endpoint, so `stream2` fails
+
+An exclusive claim excludes every other stream on the endpoint, so `stream2` (movie audio)
+gets `AUDCLNT_E_DEVICE_IN_USE` whenever `excl` is running. That was already true whenever
+the self-test passed (16:53, and both of the runs above), but the async gate makes it
+unconditional: a *failing* self-test used to have released the device before `stream2` was
+created (17:10 / 17:36 / 18:28), and now `stream2` always initializes against a claimed
+device. Only the "dead device → roll back to `shared`" path loses its movie audio; `shared`
+and `asio` are unaffected.
+
+### Docs
+
+- README / README.zh-CN: version badge, boot-banner string, the `excl` self-test bullet (it
+  no longer runs on the game's init thread) and the ASIO-rollback bullet (the ring-discard
+  race is closed).
+
+### Deferred (documented, not changed)
+
+- `FakeRC::GetBuffer` hands out one shared staging buffer and keeps no record of the
+  outstanding length; the observed CRI pattern never nests `GetBuffer` calls.
+- `NotifyLogger` is never unregistered and its extra reference is never released - COM calls
+  are not safe from `DllMain`, so it stays a deliberate process-lifetime leak.
+- `RingResyncToLatest(keep > 0)` has no caller, and a non-zero `keep` would move `g_rr`
+  backwards - a latent trap rather than a bug.
+
+### Build
+
+`/W4`: zero warnings (DLL).
 
 ---
 

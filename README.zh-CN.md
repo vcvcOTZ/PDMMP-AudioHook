@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.9-informational)
+![Version](https://img.shields.io/badge/version-v13.10-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 把游戏的音频**客户端**（不是代码）整个换掉，让引擎缓冲从链路里消失，再把游戏的 PCM 通过你选择的后端渲染出去：**ASIO**、**WASAPI 独占**或 **WASAPI 共享**。
@@ -140,7 +140,7 @@ v13 走了另一条路：**把 CRI 交给一个由本模组拥有的客户端对
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. 启动游戏，查看 `mods/Audio Hook/audio_hook.log`——表头应显示 `v13.9` 和 `MODE: v13 takeover`。
+4. 启动游戏，查看 `mods/Audio Hook/audio_hook.log`——表头应显示 `v13.10` 和 `MODE: v13 takeover`。
 
 ---
 
@@ -370,11 +370,11 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 ## 已知限制
 
 - **WASAPI 独占对负载敏感。** 干净地单独跑探测能达到约 99.5% 的实时速率，但游戏内通常只有 ~94.5%，吃 CPU 的后台程序还会拖得更低；有些设备（板载 codec）时钟几乎不动（~0.3%）。因此后端会自检并回退；它不是默认值、不是推荐路径。
-- **独占自检跑在游戏的初始化线程上**，所以 `output = excl` 会给首次音频初始化加约 2.2 秒（跳过 200 ms 时钟起步 + 测 2 秒）。实验可接受；默认不用。
+- **独占自检自 v13.10 起由 watchdog 线程执行**，与播放重叠，`output = excl` 不再拖慢游戏的音频初始化——此前它跑在游戏初始化线程上，会加约 2.2 秒（跳过 200 ms 时钟起步 + 测 2 秒）。窗口按真实经过时间计量，判定在播放开始后几秒内给出。
 - **影片音频（stream2）** 在 `asio`/`shared` 模式下仍走真实 WASAPI 流。`excl` 模式下设备被独占，stream2 初始化失败（`AUDCLNT_E_DEVICE_IN_USE`）、过场音静音——这对游玩无影响、符合预期。
 - **共享模式无法低于引擎缓冲**（多数驱动约 22 ms）。那是平台地板，与本模组无关。
 - `shared`/`excl` 只使用默认渲染端点。
-- **不再有无谓的 ASIO 回退：** `asio` 后端不再在切歌/流切换时无谓地回退到 `shared`（v13.9 通过欠载宽限窗口 + 生产者空闲守卫修复）；环形缓冲丢弃与消费线程竞争仍是已记录、未改变的限制。
+- **不再有无谓的 ASIO 回退：** `asio` 后端不再在切歌/流切换时无谓地回退到 `shared`（v13.9 通过欠载宽限窗口 + 生产者空闲守卫修复）；环形缓冲丢弃与消费线程的竞争已在 v13.10 修掉——读游标改用 compare-exchange 发布，丢弃不会再被在途的读撤销。
 
 ---
 
