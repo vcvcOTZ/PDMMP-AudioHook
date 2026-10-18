@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.7 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.8 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -208,6 +208,20 @@ static volatile LONG   g_kicked    = 0;   /* stream1 died while bridging */
 static volatile LONG   g_asioStartReq = 0;
 static volatile LONG   g_s1BufFrames  = 0; /* measured stream1 buffer (frames) */
 static volatile LONG   g_asioBusy     = 0; /* inside AsioFill (callback in flight) */
+
+/* fake-client state — declared here (not with the fake code further down) so
+   the ASIO realtime callback can test g_fake.running */
+struct FakeState
+{
+    IAudioClient* self;
+    WAVEFORMATEX  fmt;
+    short*        stage;         /* FAKE_FRAMES*2 shorts - GetBuffer() target */
+    short*        zero;          /* silent-release source */
+    HANDLE        ev;
+    volatile LONG on;
+    volatile LONG running;
+};
+static FakeState g_fake;
 
 #define S1_MAX 8
 static volatile LONG g_s1ClientN = 0;
@@ -469,7 +483,12 @@ static void AsioFill(long index)
     /* robustness: this runs on the ASIO realtime callback thread. Never do
        file I/O, allocation, or logging here — it can stall the callback and
        worsen underruns. The monitor thread reports the counter once a second. */
-    if (got < (unsigned)blk)
+    /* When the fake driver is stopped (song end / game exit) the ring is empty
+       by design, so that is NOT an underrun: counting it floods the counter
+       (500+ per second) and makes the monitor roll ASIO back to a shared stream
+       the game no longer needs, which stalls the exit. In the legacy tap path
+       there is no fake driver, so an empty ring is a real underrun there. */
+    if (got < (unsigned)blk && (!g_fakeClient || g_fake.running))
         InterlockedIncrement(&g_underruns);
     for (int c = 0; c < 2; c++)
         WriteSamples(g_abufs[c].buffers[index], g_aci[c].type, c, g_tmp, got, (unsigned)blk);
@@ -1165,18 +1184,6 @@ static HRESULT STDMETHODCALLTYPE Hook_SetEventHandle(IAudioClient* self, HANDLE 
 #define FAKE_FRAMES 441          /* 10 ms @44.1k - exactly what CRI requests */
 #define FAKE_CHUNK  441          /* CRI's fill chunk */
 #define FAKE_LOW    220          /* refill CRI when the queue drops below ~5 ms */
-
-struct FakeState
-{
-    IAudioClient* self;
-    WAVEFORMATEX  fmt;
-    short*        stage;         /* FAKE_FRAMES*2 shorts - GetBuffer() target */
-    short*        zero;          /* silent-release source */
-    HANDLE        ev;
-    volatile LONG on;
-    volatile LONG running;
-};
-static FakeState g_fake;
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_GBS)(IAudioClient*, UINT32*);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_GLAT)(IAudioClient*, REFERENCE_TIME*);
@@ -2461,9 +2468,22 @@ static void WriteDetachReport(void)
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
-    (void)hinstDLL; (void)lpvReserved;
+    (void)hinstDLL;
     if (fdwReason == DLL_PROCESS_DETACH)
     {
+        if (!lpvReserved)
+        {
+            /* FreeLibrary: our worker threads are still alive, so stop them.
+               The game only owns stream1 (the fake client); nothing else stops
+               WoThread or the fake driver, and left running they keep playing
+               stale ring data and can touch freed code. */
+            InterlockedExchange(&g_woRun, 0);
+            InterlockedExchange(&g_fake.running, 0);
+            Sleep(20);   /* give them a moment to observe the flag and exit */
+        }
+        /* process exit (lpvReserved != NULL): the OS is already tearing the
+           threads down, so there is nothing to stop here. */
+
         /* timeBeginPeriod(1) raises the timer resolution for the WHOLE system,
            so it has to be given back even when the process is going away
            (audit N11). */
@@ -2513,7 +2533,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v13.7 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.8 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");

@@ -16,8 +16,8 @@
 # 急救：同目录放空文件 audio_hook.off
 
 fake_client = 1
-output      = excl
-asio        = 0
+output      = asio
+asio        = 1
 asio_driver = *
 block       = 64
 handoff_ms  = 0

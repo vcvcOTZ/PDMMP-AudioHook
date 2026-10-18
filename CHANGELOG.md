@@ -3,8 +3,26 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.7`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.8`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.8] — 2026-10-18
+
+### Fixed — clean exit (one alt+F4, no burst of noise on quit)
+
+On exit the game stops stream1, which empties the ring while the ASIO callback kept
+running. The callback treated that empty ring as an underrun — flooding the counter
+(500+ per second) until the monitor triggered `runaway underruns` and rolled ASIO back to
+a shared stream the game no longer needed, stalling the exit (it took two alt+F4 to quit).
+
+- The ASIO callback no longer counts an empty ring as an underrun while the fake driver is
+  stopped (`g_fake.running`); the legacy tap path keeps counting as before.
+- `DllMain` now stops the writer and fake-driver threads on `DLL_PROCESS_DETACH` (FreeLibrary
+  case only; on process exit the OS is already tearing them down).
+- `struct FakeState` moved up so the ASIO realtime callback can read `g_fake.running`.
+- `audio_hook.txt` ships with `output = asio` again (v13.7 accidentally packed `output = excl`).
 
 ---
 
