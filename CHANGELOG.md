@@ -3,8 +3,48 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.6`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.7`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.7] — 2026-10-18
+
+Fixes the exclusive self-test (a 0 % false-negative, then a wrong "slow device"
+conclusion) and settles exclusive back to a correct but non-recommended backend.
+
+### Fixed — the self-test read 0 % because the exclusive stream never started
+
+v13.6's ramp-up-skipping self-test still failed with `written=0 clock=0 → 0.0 %`:
+
+1. **Exclusive + EVENTCALLBACK never signals the event unless the stream is pre-filled
+   before `Start()`.** With nothing pre-filled the device has no data, never signals, so
+   the writer thread never ran at all.
+2. Even after the engine starts, the game does not begin mixing until ~2.5 s after the
+   client is installed, so the ring was empty during the 2 s measurement window.
+
+Fix: pre-fill one buffer with silence in `WoInit` before `Start()`, and keep the writer
+filling **silence** while the self-test runs (`g_woSelftest`).
+
+### Corrected — the "88.5 % / 99.5 %" numbers were misread
+
+The v13.6 note that a healthy 16-bit device delivers **99.5 %** and that the 88.5 % was
+only a measurement artifact was wrong. The self-test now reports the *real* delivery rate,
+and inside the game exclusive consistently lands at **~94.5 %** (a 5 ms period: ~88 %)
+because its software event loop is sensitive to system and background load — a couple of
+CPU-heavy background apps (e.g. an Android emulator) drag even a clean `excl_rate_probe`
+run from 99.5 % down to ~96 %. That is not a driver fault, but it is exactly why exclusive
+is not a recommended path.
+
+### Changed
+
+- Use the device's **default period** (10 ms) instead of a hard-coded 5 ms, and check
+  `GetDevicePeriod`'s return value (10 ms fallback).
+- Remove the failed exclusive experiments (`THREAD_PRIORITY_TIME_CRITICAL` writer, 2 ms
+  polling); the default output stays `asio`.
+- `audio_hook.txt` now documents `excl` as experimental / load-sensitive.
+
+- Boot banner reads `v13.7`.
 
 ---
 

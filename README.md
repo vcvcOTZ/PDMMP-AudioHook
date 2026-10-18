@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.6-informational)
+![Version](https://img.shields.io/badge/version-v13.7-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -66,7 +66,7 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 |---|---|
 | `asio` *(default)* | Native ASIO driver. Lowest, most consistent result on the test hardware. |
 | `shared` | Our own WASAPI shared-mode stream. Works on **any** device, no ASIO driver required. |
-| `excl` | WASAPI exclusive, 5 ms period when the driver honours it. Guarded by a **2 s self-test** (after skipping the ~70 ms clock ramp-up): if the device delivers less than 95 % of real time, the backend is torn down and the mod falls back to `shared`. |
+| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (after skipping the ~70 ms clock ramp-up): if the device delivers less than 95 % of real time, the backend is torn down and the mod falls back to `shared`. |
 
 With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
 registry order and keeps the first one that fully initialises — the log shows each attempt
@@ -113,7 +113,7 @@ Objective numbers, measured with a USB ASIO interface at 44.1 kHz:
 | ASIO block size | 64 frames = **1.45 ms** |
 | ASIO driver-reported latency | 181 frames in / out = **4.1 ms** |
 | WASAPI shared engine buffer | 970 frames = **22.0 ms** @44.1 kHz (1056 @48 kHz) |
-| WASAPI exclusive period (as granted by that driver) | 221 frames = **5.01 ms** |
+| WASAPI exclusive period (device default) | 441 frames = **10.0 ms** |
 
 Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s delivered, 0 underruns, 0 dropped frames** over 25 s runs.
 
@@ -147,7 +147,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.6` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.7` and `MODE: v13 takeover`.
 
 ---
 
@@ -191,14 +191,25 @@ If the endpoint is **not 44.1 kHz** (48 kHz HDMI / Bluetooth / onboard is common
 
 ### `excl`
 
-Opens `AUDCLNT_SHAREMODE_EXCLUSIVE` with `duration == periodicity` (5 ms) and event-driven callbacks. Because exclusive mode bypasses the engine, the device must be free — and since stream1 no longer opens a real stream, it is.
+Opens `AUDCLNT_SHAREMODE_EXCLUSIVE` with `duration == periodicity` (the device's
+default period, typically 10 ms) and event-driven callbacks. Because exclusive mode
+bypasses the engine, the device must be free — and since stream1 no longer opens a real
+stream, it is.
 
-The catch is driver quality. Of the devices tested so far:
+Exclusive's weakness is that its software event loop is **sensitive to system and
+background load**. A clean standalone run (`excl_rate_probe`) can reach ~99.5 % of real
+time, but inside the game it typically delivers **~94.5 %** (and CPU-heavy background
+apps, such as an Android emulator, drag even the standalone probe down to ~96 %). Some
+devices are genuinely unusable: one onboard codec initialises but keeps its device clock
+at **~0.3 %**.
 
-- one USB interface — **16-bit** exclusive runs at **99.5 %** of real time (usable), but its **24-bit** path only reaches **94 %**;
-- one onboard codec — initialises with 480 frames at 48 kHz, but the **device clock stays at ~0.3 %**.
-
-So v13 measures the device clock at startup and rolls back to `shared` when the rate is under 95 %. An early build measured over a 600 ms window and misread the healthy USB interface as 88.5 % — the clock takes ~70 ms to ramp up after `Start()`; the self-test now skips that ramp-up and measures over 2 s. After a genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the watchdog only rebuilds `shared` — so changing `output = excl` to stick requires a game restart. Use `tools/excl_rate_probe.exe` to check your own device:
+So v13 measures the device clock at startup and rolls back to `shared` when the rate is
+under 95 % — which is what exclusive usually does in practice, and why it is not the
+default and not recommended. The self-test fills silence to keep the clock moving before
+the game starts mixing, skips the ~70 ms clock ramp-up, and measures over 2 s. After a
+genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the
+watchdog only rebuilds `shared` — so changing `output = excl` to stick requires a game
+restart. Use `tools/excl_rate_probe.exe` to check your own device:
 
 ```
 excl_rate_probe --list
@@ -414,8 +425,8 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 
 ## Known limitations
 
-- **WASAPI exclusive is driver-dependent.** Measured so far: a USB interface at **99.5 %** (16-bit; 24-bit only **94 %**), an onboard codec at **0.3 %** of real time. The backend therefore self-tests and falls back; it is not the default and not a recommended path.
-- **The exclusive self-test runs on the game's init thread**, so `output = excl` adds ~2.2 s to the first audio initialisation (200 ms clock ramp-up skip + 2 s measurement; the old 600 ms test misread the ramp-up as a slow device). Acceptable for an experiment; not used by default.
+- **WASAPI exclusive is load-sensitive.** A clean standalone probe can reach ~99.5 % of real time, but inside the game it typically delivers ~94.5 %, and CPU-heavy background apps drag it lower still; some devices (an onboard codec) never move their clock (~0.3 %). The backend self-tests and falls back; it is not the default and not a recommended path.
+- **The exclusive self-test runs on the game's init thread**, so `output = excl` adds ~2.2 s to the first audio initialisation (200 ms clock ramp-up skip + 2 s measurement). Acceptable for an experiment; not used by default.
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.

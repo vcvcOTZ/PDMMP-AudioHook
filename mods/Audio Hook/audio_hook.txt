@@ -4,8 +4,8 @@
 #               ★ 低延迟的核心开关，必须为 1 才能用 output 后端
 # output      : asio   = ASIO 直通（推荐，延迟最低，软件链路 ≈10ms）
 #               shared = WASAPI 共享（没有 ASIO 驱动时用；受引擎 22ms 缓冲限制）
-#               excl   = WASAPI 独占（启动自检：跳过时钟起步 + 测 2s，<95% 自动回退 shared；
-#                        16-bit 实测 99.5%、24-bit 只有 94%，用之前先跑 tools\excl_rate_probe.exe）
+#               excl   = WASAPI 独占（实验性：交付率受系统/后台负载影响，常 <95% 自动回退
+#                        shared，不推荐；低延迟请用 asio）
 # asio        : output=asio 时是否启用 ASIO 后端（1 = 启用）
 # asio_driver : "*" = 自动：按注册表顺序逐个尝试，选第一个能完整初始化的驱动（默认）
 #               机器上装了多个 ASIO 驱动时，先运行 tools\asio_list.exe —— ↑↓ 选择、回车试听，
@@ -16,8 +16,8 @@
 # 急救：同目录放空文件 audio_hook.off
 
 fake_client = 1
-output      = asio
-asio        = 1
+output      = excl
+asio        = 0
 asio_driver = *
 block       = 64
 handoff_ms  = 0

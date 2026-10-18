@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.6 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.7 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -15,7 +15,7 @@
  *            output = asio     native ASIO driver
  *            output = shared   our own WASAPI shared stream (resamples if the
  *                              endpoint is not 44.1 kHz)
- *            output = excl     WASAPI exclusive, guarded by a 600 ms self-test
+ *            output = excl     WASAPI exclusive, guarded by a 2 s self-test
  *
  * Patched vtable slots (data layer only, never a code byte):
  *   IAudioClient          [3] Initialize, [14] GetService,
@@ -72,6 +72,7 @@ static int  g_outMode = 0;       /* 0 = ASIO, 1 = WASAPI exclusive, 2 = WASAPI s
 static volatile LONG g_woState = 0;   /* 0=off 2=starting 3=running 4=failed */
 static volatile LONG g_woReading = 0; /* WoThread is actively consuming the ring */
 static volatile LONG g_woFault = 0;   /* WoThread hit a dead device and bailed out */
+static volatile LONG g_woSelftest = 0;/* exclusive self-test running: fill silence to keep the clock moving */
 static volatile LONG g_woUnder = 0;
 static volatile LONG g_woCbs   = 0;
 static volatile LONG64 g_woOut = 0;   /* frames handed to the output stream */
@@ -1552,8 +1553,9 @@ static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
 /*  v13: WASAPI output backends  (exclusive / shared)                    */
 /*                                                                       */
 /*  With stream1 faked, the audio device is free. We can therefore open   */
-/*  our own stream on it - exclusive (5 ms period) or shared (engine      */
-/*  period) - and feed it from the same ring the ASIO path uses.          */
+/*  our own stream on it - exclusive (device default period, 10 ms) or    */
+/*  shared (engine period) - and feed it from the same ring the ASIO      */
+/*  path uses.                                                            */
 /* ===================================================================== */
 
 static IAudioClient*       g_woClient = NULL;
@@ -1741,6 +1743,13 @@ static DWORD WINAPI WoThread(LPVOID)
         UINT32 avail = RingAvail();
         if (g_rsStep > 1.0) avail = (UINT32)((double)avail / g_rsStep);
         UINT32 n = free_ < avail ? free_ : avail;
+        /* During the exclusive self-test the game has not started mixing yet, so
+           the ring is empty and `n` would be 0 -> nothing written -> the device
+           has no data -> its clock never advances -> the self-test reads 0 % (a
+           false negative). Fill silence to keep the clock moving so the test
+           measures the real delivery rate (WoFill16/WoFillFloat already pad
+           with zeros when the ring is dry). */
+        if (!n && g_woSelftest) n = free_;
         if (n)
         {
             BYTE* p = NULL;
@@ -1854,8 +1863,23 @@ static BOOL WoInit(int exclusive)
         goto done;
     }
 
-    REFERENCE_TIME dur = exclusive ? 50000 : 0;
-    REFERENCE_TIME per = exclusive ? 50000 : 0;
+    REFERENCE_TIME dur = 0;
+    REFERENCE_TIME per = 0;
+    if (exclusive)
+    {
+        /* Use the device's default period instead of a hard-coded 5 ms. A 5 ms
+           EVENTCALLBACK period collapses to ~88 % under any scheduling jitter,
+           and even the default 10 ms period only reaches ~94.5 % inside the
+           game: exclusive's software event loop is sensitive to system and
+           background load (unlike ASIO's driver callback). Exclusive is not a
+           recommended path - the default period just makes it as correct as it
+           can be before the self-test rolls it back to shared. */
+        REFERENCE_TIME def = 0, mn = 0;
+        if (FAILED(g_woClient->GetDevicePeriod(&def, &mn)) || def <= 0)
+            def = 100000;   /* 10 ms fallback */
+        dur = def;
+        per = def;
+    }
     hr = g_woClient->Initialize(exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE : AUDCLNT_SHAREMODE_SHARED,
                                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, per, wf, NULL);
     if (FAILED(hr))
@@ -1873,6 +1897,21 @@ static BOOL WoInit(int exclusive)
     { Log("[wo] !! event setup failed"); goto done; }
     if (FAILED(g_woClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_woRender)) || !g_woRender)
     { Log("[wo] !! GetService render failed"); goto done; }
+
+    if (exclusive)
+    {
+        /* Exclusive + EVENTCALLBACK never signals the event unless the stream is
+           pre-filled before Start(): with no data the device has nothing to play,
+           so no event fires, the writer never runs, and the self-test reads
+           written=0/clock=0. Fill one buffer with silence so the engine starts. */
+        BYTE* pre = NULL;
+        if (SUCCEEDED(g_woRender->GetBuffer(g_woFrames, &pre)) && pre)
+        {
+            memset(pre, 0, (size_t)g_woFrames * wf->nBlockAlign);
+            g_woRender->ReleaseBuffer(g_woFrames, 0);
+            Log("[wo] exclusive pre-filled %u frames of silence", g_woFrames);
+        }
+    }
 
     g_woCh = wf->nChannels;
     RsReset();
@@ -1919,11 +1958,14 @@ static void WoShutdown(void)
 }
 
 /* Init + start. exclusive==1 -> exclusive, else shared.
-   Exclusive gets a 600 ms self-test: some USB interfaces hand out a 5 ms buffer
-   but only consume ~88% of real time, which starves the queue and
-   makes the game's music stutter/repeat. The self-test now cross-checks the
-   device clock (IAudioClock) as well, because "frames written" alone can look
-   healthy while the hardware is not moving. */
+   Exclusive runs a self-test (skip the clock ramp-up, then measure 2 s) and
+   rolls back to shared when the device delivers under 95 % of real time. That
+   threshold matters: exclusive's software event loop is sensitive to system and
+   background load, so inside the game it typically delivers ~94.5 % (a 5 ms
+   period: ~88 %) - not a driver fault, but the reason exclusive is not the
+   recommended path. The self-test cross-checks the device clock (IAudioClock)
+   as well, because "frames written" alone can look healthy while the hardware
+   is not moving. */
 static BOOL WoStart(int exclusive)
 {
     /* ASIO and the WASAPI backend must never run at once: both read the same
@@ -1991,11 +2033,16 @@ static BOOL WoStart(int exclusive)
         if (SUCCEEDED(g_woClient->GetService(__uuidof(IAudioClock), (void**)&ck)) && ck)
             haveClk = SUCCEEDED(ck->GetPosition(&c0, NULL));
 
-        /* The old 600 ms window under-reported the rate: the device clock takes
-           ~70 ms to actually start after Start(), and on a 600 ms average that
-           alone reads as 88.5 % - which made a healthy 99.5 % device look like
-           it "cannot run exclusive" and rolled it back every time. Skip the
-           ramp-up, then measure over a 2 s window (the "88.5 %" myth). */
+        /* Two false-failure modes to avoid: (1) the clock needs ~70 ms to ramp
+           up after Start(), so a 600 ms window under-reports; (2) the game does
+           not start mixing until ~2.5 s after the client is installed, so over
+           an empty ring nothing is written and the clock never advances -> 0 %.
+           Skip the ramp-up, measure over 2 s, and flag the writer to fill
+           silence so the clock keeps moving before the game starts mixing. The
+           number it then reports is the REAL delivery rate (exclusive typically
+           reads ~94.5 % inside the game because system/background load steals
+           its software event loop), not a measurement artifact. */
+        InterlockedExchange(&g_woSelftest, 1);
         Sleep(200);
         if (haveClk) ck->GetPosition(&c0, NULL);
         LONG64 out0 = (LONG64)g_woOut;
@@ -2008,6 +2055,7 @@ static BOOL WoStart(int exclusive)
         if (haveClk && SUCCEEDED(ck->GetPosition(&c1, NULL)))
             clkRate = (double)(c1 - c0) / 2.0;
         if (ck) ck->Release();
+        InterlockedExchange(&g_woSelftest, 0);
 
         double rate = outRate;
         if (haveClk && clkRate > 0.0 && clkRate < rate) rate = clkRate;  /* the honest one */
@@ -2465,7 +2513,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v13.5 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.7 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");
