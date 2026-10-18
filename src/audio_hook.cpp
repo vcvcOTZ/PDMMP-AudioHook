@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.5 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.6 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -1991,13 +1991,22 @@ static BOOL WoStart(int exclusive)
         if (SUCCEEDED(g_woClient->GetService(__uuidof(IAudioClock), (void**)&ck)) && ck)
             haveClk = SUCCEEDED(ck->GetPosition(&c0, NULL));
 
-        Sleep(600);
+        /* The old 600 ms window under-reported the rate: the device clock takes
+           ~70 ms to actually start after Start(), and on a 600 ms average that
+           alone reads as 88.5 % - which made a healthy 99.5 % device look like
+           it "cannot run exclusive" and rolled it back every time. Skip the
+           ramp-up, then measure over a 2 s window (the "88.5 %" myth). */
+        Sleep(200);
+        if (haveClk) ck->GetPosition(&c0, NULL);
+        LONG64 out0 = (LONG64)g_woOut;
 
-        LONG64 out = g_woOut;
-        double outRate = (double)out / 0.6;
+        Sleep(2000);
+
+        LONG64 out = (LONG64)g_woOut - out0;
+        double outRate = (double)out / 2.0;
         double clkRate = 0.0;
         if (haveClk && SUCCEEDED(ck->GetPosition(&c1, NULL)))
-            clkRate = (double)(c1 - c0) / 0.6;
+            clkRate = (double)(c1 - c0) / 2.0;
         if (ck) ck->Release();
 
         double rate = outRate;

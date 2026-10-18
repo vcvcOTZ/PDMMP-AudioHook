@@ -3,8 +3,32 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.5`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.6`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.6] — 2026-10-18
+
+Corrects a long-standing wrong conclusion about WASAPI exclusive mode.
+
+### Fixed — exclusive self-test misread the clock ramp-up as a slow device
+
+The `output = excl` self-test measured the device clock over a **600 ms** window taken
+right after `Start()`, when the clock was still ramping up (~70 ms). `(600 − 70) / 600 ≈
+88.3 %`, so a healthy **99.5 %** USB interface read as **88.5 %** and was rolled back on
+every launch — which is where the "this driver cannot run exclusive" conclusion came from.
+
+The self-test now skips the ramp-up (200 ms), re-reads the clock/frame counter, then
+measures over a **2 s** window. A fixed `excl_rate_probe --seconds 10` run confirms the
+truth: **16-bit = 99.5 %** (usable), **24-bit = 94 %** (genuinely slow — the device clock
+really does lag there, it is not a measurement artifact).
+
+### Docs
+
+- README / README.zh-CN / `audio_hook.txt`: replaced the "88.5 % / cannot run exclusive"
+  wording with the corrected 16-bit 99.5 % / 24-bit 94 % split, and the 600 ms self-test
+  description with the 2 s ramp-up-skipping one. `config.toml` → 0.3.6.
 
 ---
 
