@@ -44,6 +44,29 @@ jobs:
             src/excl_rate_probe.exe
             src/session_tool.exe
 
+      - name: Extract release notes for this tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # Release notes are curated in CHANGELOG.md, not auto-generated from commits.
+          # Take the section for this tag ("## [<tag>]") up to the next "## [" heading.
+          $tag = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          $lines = Get-Content CHANGELOG.md
+          $hit = $lines | Select-String -Pattern "^## \[$([regex]::Escape($tag))\]" | Select-Object -First 1
+          if (-not $hit) {
+            "No CHANGELOG.md section found for v$tag." | Set-Content RELEASE_NOTES.md
+            Add-Content RELEASE_NOTES.md "See [CHANGELOG.md](CHANGELOG.md) for the full history."
+            Write-Host "no section for v$tag - wrote a pointer instead"
+            exit 0
+          }
+          $start = $hit.LineNumber
+          $end = $lines.Count
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## \[') { $end = $i; break }
+          }
+          $lines[($start - 1)..($end - 1)] -join "`n" | Set-Content RELEASE_NOTES.md -Encoding utf8
+          Write-Host "extracted CHANGELOG.md lines $start..$end for v$tag"
+
       - name: Attach to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -53,7 +76,4 @@ jobs:
             src/asio_list.exe
             src/excl_rate_probe.exe
             src/session_tool.exe
-          # No auto-generated body: the release notes are curated in CHANGELOG.md and
-          # written onto the release itself, so this step must only attach the binaries.
-          # (softprops only touches the body when body / body_path / generate_release_notes
-          #  is given - omitting all three leaves the curated notes in place.)
+          body_path: RELEASE_NOTES.md
