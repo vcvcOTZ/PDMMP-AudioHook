@@ -1379,7 +1379,11 @@ static DWORD WINAPI FakeDriverThread(LPVOID)
         Sleep(5);
         unsigned a = RingAvail();
         unsigned n = a >= FAKE_CHUNK ? FAKE_CHUNK / 2 : a;
-        if (n) { static short tmp[512]; RingRead(tmp, n); }
+        /* tmp must hold `n` stereo frames. RingAvail() is capped at FAKE_FRAMES
+           by FakeRC::GetBuffer's back-pressure, so n is at most FAKE_CHUNK-1 =
+           440 frames (880 shorts). The old tmp[512] (256 frames) overflowed
+           whenever CRI handed us a 257..440-frame chunk (e.g. a partial fill). */
+        if (n) { static short tmp[FAKE_CHUNK * 2]; RingRead(tmp, n); }
         FakePoke();
     }
     Log("[fake] driver stopped");
@@ -2339,8 +2343,12 @@ static void WriteDetachReport(void)
 
     SYSTEMTIME st; GetLocalTime(&st);
     char line[768];
+    /* wsprintfA does not understand "%lld" (it only knows "%l" and "%I64");
+       "%lld" used to read the 64-bit frame counters as 32-bit, so taps/zeroed
+       printed garbage. Use the Win32-only "%I64d" (keeps this DllMain path free
+       of CRT dependencies). */
     int n = wsprintfA(line,
-        "=== DETACH %04u-%02u-%02u %02u:%02u:%02u.%03u  init=%ld rc=%ld | asio st=%ld cbs=%ld taps=%lld und=%ld zeroTap=%ld zeroed=%lld kicked=%ld ===\r\n",
+        "=== DETACH %04u-%02u-%02u %02u:%02u:%02u.%03u  init=%ld rc=%ld | asio st=%ld cbs=%ld taps=%I64d und=%ld zeroTap=%ld zeroed=%I64d kicked=%ld ===\r\n",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         g_initCalls, g_rcCalls, g_asioState, g_asoCbs, (long long)g_tapFrames,
         g_underruns, g_zeroTap, (long long)g_zeroed, g_kicked);
