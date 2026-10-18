@@ -7,6 +7,8 @@
 ![Version](https://img.shields.io/badge/version-v13.5-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 Replaces the game's audio **client** (not its code) so the engine buffer disappears from the path, then renders the game's PCM through a backend of your choice: **ASIO**, **WASAPI exclusive** or **WASAPI shared**.
 
 Only COM **vtable** slots are patched — the executable is left byte-for-byte untouched, so the game's anti-tamper (Denuvo) is not triggered.
@@ -29,7 +31,7 @@ Only COM **vtable** slots are patched — the executable is left byte-for-byte u
 - [Building from source](#building-from-source)
 - [Known limitations](#known-limitations)
 - [Changelog](CHANGELOG.md)
-- [中文说明](#中文说明)
+- [简体中文](README.zh-CN.md)
 - [License](#license)
 
 ---
@@ -422,22 +424,7 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 
 ## 中文说明
 
-把游戏（CRI ADX2）的 **stream1 音频客户端整个换掉**：CRI 以为在往 WASAPI 写，实际写进本模组的内存。于是游戏自带的 **22 ms 引擎缓冲彻底不在链路里**，设备也完全空出来给自选输出后端。
-
-- **三个输出后端**（`audio_hook.txt` 的 `output`）：
-  - `asio`（默认，推荐）：原生 ASIO 驱动，block 64 = 1.45 ms，驱动报告 4.1 ms。
-  - `shared`：自己开一条 WASAPI 共享流，**不需要 ASIO 驱动**，任何设备可用；引擎 22 ms 缓冲是平台地板。
-  - `excl`：WASAPI 独占（5 ms 周期），带 **600 ms 启动自检**，设备跑不满 95% 就自动回退到 shared。
-- **默认驱动**：`asio_driver = *` 表示自动 —— 按注册表顺序逐个尝试，选第一个能完整初始化的驱动（日志会写明每次尝试和最终选中的那个）。机器上装了多个 ASIO 驱动时，建议用 `asio_list` 试听后把完整名字填进去。
-- **实测**（44.1 kHz 设备）：CRI 缓冲区 441 帧 = 10 ms；ASIO 64 帧 = 1.45 ms；共享引擎 970 帧 = 22 ms。稳态 44,100 帧/秒、0 欠载。
-- **独占实测结论**：试过的 USB 声卡设备时钟只有 88.5%、板载 codec 只有 0.3% —— 驱动接受独占流但不真正跑，所以**独占不适合当主推**，本模组会自动降级。
-- **安装**：`Audio Hook` 文件夹放进 `mods/`，根 `config.toml` 的 `priority` 加 `"Audio Hook"`。
-- **急救**：同目录放空文件 `audio_hook.off`；或 `fake_client = 0` + `asio = 0` 回到旧的纯 WASAPI 优化。
-- **配套工具**（`tools/`，也可从 Release 下载）：
-  - `asio_list` —— 列出本机所有 ASIO 驱动，↑↓ 选择、回车播放 3 秒测试音，**哪个声卡出声就是它**；`--list` 纯列表、`--test "名字"` 直接试听。填进 `asio_driver` 的就是它显示的名字（要用完整名，子串匹配取第一个）。
-  - `excl_rate_probe` —— 测某设备的独占/共享流**是否真的实时**：`excl_rate_probe --list`、`excl_rate_probe "Speakers" --seconds 2`、`excl_rate_probe default --shared`。看 `device clock` 的百分比：≥95% 可用、90~95% 勉强、<50% 驱动根本没启动硬件。
-  - `session_tool` —— 会话诊断：不带参数列出各设备所有音频会话（状态/静音/音量/峰值）；`--unmute DivaMegaMix` 清除旧版遗留的持久静音（需游戏运行中执行）。
-- **更新日志**：见 [CHANGELOG.md](CHANGELOG.md)。
+完整中文文档请见 [README.zh-CN.md](README.zh-CN.md)。
 
 ---
 
