@@ -1,8 +1,8 @@
 enabled = true
 name = "Audio Hook"
 description = "Low-latency audio: replaces CRI's audio client (no engine buffer), ASIO / WASAPI exclusive / WASAPI shared output"
-version = "0.3.0"
-date = "17.10.2026"
+version = "0.3.1"
+date = "18.10.2026"
 author = "vcvcOTZ"
 
 dll = ["audio_hook.dll"]

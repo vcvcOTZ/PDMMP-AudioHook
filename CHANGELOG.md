@@ -8,6 +8,125 @@ and only marks packaging changes.
 
 ---
 
+## [13.1] — 2026-10-18
+
+Fixes the issues raised in `AUDIT-v13.0.md` (48 findings; the ones deliberately
+left open are listed at the end). The normal path (`fake_client=1`, `output=asio`)
+behaves exactly as before — everything below is about failure paths, non-default
+backends and non-44.1 kHz devices.
+
+### Fixed — crash / process-level
+
+- **fake_client=1 with asio=0 crashed on the first `ReleaseBuffer`.** The ring was
+  allocated only `if (g_asioEn)`; `RingAvail()` on a NULL ring returns 0 without
+  dereferencing, so the capacity check passed and `RingWrite()` memcpy'd into NULL.
+  The ring is now always allocated, every ring access is NULL-guarded, and the
+  combination is auto-corrected to `output = shared` (logged).
+- **Exclusive rollback freed COM objects under its writer thread.** The code logged
+  "leaking instead of crashing" and then released unconditionally. All teardown now
+  goes through `WoShutdown()`, which waits up to 2 s for the thread to leave its
+  loop and, if it does not, leaks on purpose.
+- **`AsioPrepare()` leaked the driver on every failure path** after `init()`
+  succeeded (wrong driver name, <2 outputs, bad rate, `createBuffers` failure,
+  allocation failure). All paths now converge on one `fail:` label that calls
+  `stop()` / `disposeBuffers()` / `Release()`, so the device is free again.
+
+### Fixed — functional
+
+- **ASIO rollback in fake mode was permanent silence.** With the client faked there
+  is no real WASAPI stream to "return" to; the rollback now starts the shared
+  backend, and `g_asioStartReq` is reset so a later retry is possible.
+- **`shared` had no sample-rate guard:** a 48 kHz endpoint played the whole game
+  8.8 % fast (~1.5 semitones up). Added a linear resampler (44.1 kHz → device rate),
+  verified against 32 / 48 / 96 kHz: frame count within 2 frames, error ≤1 LSB.
+- **`shared` reported success even when `Start()` failed**, which blocked the ASIO
+  fallback. `WoStart()` now waits for the writer thread to report running (1 s).
+- **`g_woAlive` was left set on the `Start()` failure path**, so rollback waited 2 s
+  for a thread that had already exited.
+- **Stale session-mute cleanup did nothing with the fake client**
+  (`GetService(ISimpleAudioVolume)` → `0x88890001`). It now walks this process's
+  sessions via `IAudioSessionManager2`, and runs a second time 5 s after boot (when
+  stream2 / the output backend has created the session).
+- **Half-patched vtables could hook our own hook.** `PatchSlot(a) && PatchSlot(b)`
+  left `a` rewritten when `b` failed, and the retry captured our function as "the
+  original" → infinite recursion / stack overflow. `PatchSlots()` now pre-checks all
+  slots, installs all-or-nothing and rolls back on partial failure.
+- **`FakeInit()` failure was returned to the game** instead of falling back, leaving
+  it silent. It now restores the client and calls the real `Initialize`.
+- **Stream1 client table overflow:** after 8 rebuilds new clients were dropped
+  silently and stale pointers stayed behind. Both tables are rings now.
+- **`disposeBuffers()` could race the ASIO callback** (use-after-free on the "device
+  kicked" path). Added a callback-in-flight counter; teardown waits 200 ms and skips
+  `disposeBuffers()` rather than freeing under a running callback.
+- **SILENT releases were not tapped** (CRI sends `flags=0x2`), which starved the ring
+  during silence and tripped the "runaway underruns" rollback. They now write zeros.
+- **Config defaults contradicted the README** (`asio=0`, `fake_client=0`), so a
+  missing/old config silently downgraded to v9. Both default to 1, and the log prints
+  `MODE: v13 takeover` / `MODE: v9 buffer trim only`.
+- **`exclusive2` dead code removed** (globals, thread, SetEventHandle branch, slot-13
+  patching, `Hook_Initialize` rewrite). If an old config still sets it, the mod logs
+  that it was removed and ignores it.
+- **`Fake_Stop` / `Fake_Reset` now flush the ring**, so a restart/seek cannot replay
+  up to 10 ms of the previous song.
+- **Fake `IAudioClock::GetPosition` was frozen at 0** (`g_fakePlayed` was never
+  written). It now reports frames actually consumed plus a real QPC timestamp.
+- **`GetBuffer` used `AUDCLNT_E_BUFFER_TOO_LARGE` as back-pressure.** It now waits up
+  to 5 ms for the consumer before failing (this is CRI's mixing thread, not a
+  realtime callback).
+
+### Fixed — concurrency, timing, resources
+
+- Fake-driver drain no longer competes with a live consumer (it is gated on the writer
+  thread actually reading, not on a state flag).
+- `timeBeginPeriod(1)` at start-up: `Sleep(1)` in the handoff no longer rounds up to
+  the 15.6 ms default tick.
+- Fake mode skips the tap-and-zero handoff entirely (it used to discard up to 10 ms of
+  already mixed audio at every song start).
+- `MsNow()` guards against a zero QPC frequency (NaN used to make the handoff wait
+  exit immediately).
+- Render-client slot writes are ordered (length, barrier, pointer) so the release hook
+  cannot pair a new pointer with an old length.
+- `Log()` writes one complete line per `fwrite` (no more timestamp/body interleaving),
+  appends instead of truncating, and rotates at 4 MB to `audio_hook.log.1`.
+- `WoInit()` releases the client / event / format on every failure path; a failed
+  exclusive attempt no longer leaves the device claimed.
+- A failed backend can be retried (`g_woState == 4` is claimable again).
+- Monitor loops no longer stop after 24 h / 1 h.
+- `AsioChooseBlock` no longer spins forever when a driver reports `minBuffSize = 0`.
+- `getChannelInfo` failures and unsupported sample types now abort ASIO preparation
+  (they used to run silently, producing silence or noise).
+- Unknown ASIO formats are cleared at their real sample width (8-byte formats used to
+  keep half of every frame's stale data).
+- Fake `GetMixFormat` returns a valid 44.1 kHz / 16-bit / stereo format before
+  `Initialize` is ever called.
+- Float detection checks `WAVEFORMATEXTENSIBLE.SubFormat` (32-bit integer PCM was
+  interpreted as float → full-scale noise).
+- Config parser works line by line (a line without `=` used to swallow the following
+  keys).
+- `[notify]` timestamps are labelled `ms` (they always were milliseconds).
+- Pointer logging uses `0x%llX` instead of `%p`.
+- Boot device probing runs for 3 s instead of 20 s, and the `[out]` statistics line
+  only appears when a WASAPI backend is in use.
+
+### Deferred (documented, not changed)
+
+- **P2-4** — the exclusive self-test still runs synchronously on the game's init
+  thread (~600 ms) and claims the device before stream2 exists.
+- **P3-4** — `CoInitializeEx` on worker threads is not paired (they live for the
+  process).
+- **P3-5** — the endpoint-notification callback is not unregistered at detach (COM
+  calls inside `DllMain` are unsafe).
+- **P4-13** — device names are still converted with `CP_ACP`.
+- **P4-14** — the detach report is still written from `DllMain`.
+- **P5-6** — the single-file layout is unchanged (hook / fake client / backends / diag
+  in one translation unit).
+
+### Build
+
+Compiles with **zero warnings at `/W3` and `/W4`.
+
+---
+
 ## [13.0] — 2026-10-17
 
 The release that removes the engine buffer from the audio path.

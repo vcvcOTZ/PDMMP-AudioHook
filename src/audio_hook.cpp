@@ -1,45 +1,35 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v11.3 build, 2026-10-17, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.1 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
- * Base behaviour (always active):
- *   stream1 (game audio)  : drop RATEADJUST -> 44.5ms buffer becomes 22.0ms
- *   stream2 (movie audio) : duration 666664 -> 166666 (66.7ms -> 22.0ms)
+ * Two independent layers:
  *
- * ASIO output bridge (enabled with "asio = 1" in audio_hook.txt):
- *   The game keeps its normal WASAPI shared streams; we TAP the PCM that CRI
- *   writes into stream1 (at IAudioRenderClient::ReleaseBuffer), push it
- *   through a lock-free ring buffer, and play it out through the ASIO driver.
+ *   1) WASAPI buffer trim (always on, fake_client = 0)
+ *        stream1 (game audio)  : drop RATEADJUST -> engine buffer 44.5 -> 22.0 ms
+ *        stream2 (movie audio) : duration 666664 -> 166666 (66.7 -> 22.0 ms)
  *
- *   Key fixes (v11 -> v11.2):
- *     - de-interleave fix: each ASIO channel takes src[i*2 + ch] (v10d wrote
- *       the interleaved stream into every channel -> octave down + shredded)
- *     - handoff redesign "tap-and-zero": copy then zero the game buffer so the
- *       WASAPI path goes silent naturally, then start ASIO at the exact frame
- *       the game stopped on (no SetMute, no double audio, seamless)
- *     - kick self-healing: DEVICE_INVALIDATED -> rollback, WASAPI audible again
- *     - stale session-mute cleanup on every boot (v10d's SetMute residue)
- *     - v11.2: EXCLUSIVE-mode experiment code fully removed (it was proven
- *       non-realtime on this device and permanently rejected).
+ *   2) Client takeover (fake_client = 1, default since v13)
+ *        IAudioClient::Initialize for stream1 is intercepted and the real
+ *        Initialize is NEVER called: CRI gets our own client object, so the
+ *        engine buffer leaves the path and the device stays free. The PCM CRI
+ *        mixes goes into a lock-free ring, then out through one of:
+ *            output = asio     native ASIO driver
+ *            output = shared   our own WASAPI shared stream (resamples if the
+ *                              endpoint is not 44.1 kHz)
+ *            output = excl     WASAPI exclusive, guarded by a 600 ms self-test
  *
- *   v11.3 (robustness):
- *     - tap-steady wait now has a 30 s timeout (was an infinite loop): if the
- *       game audio never reaches real-time, the bridge gives up and stays on
- *       the WASAPI path instead of leaking a stuck worker thread
- *     - removed all logging from the ASIO realtime callback (file I/O on the
- *       callback thread could stall it and worsen underruns)
+ * Patched vtable slots (data layer only, never a code byte):
+ *   IAudioClient          [3] Initialize, [14] GetService,
+ *                         [13] SetEventHandle (only when fake_client = 1)
+ *   IAudioRenderClient    [3]/[4]  (lazy; legacy tap path only)
  *
- *   Portability: asio_driver = name substring ("*" = first driver);
- *   sample-rate guard refuses non-44100 (never pitch-shifts).
- *
- * Patched vtable slots (data layer only, no code bytes anywhere):
- *   IAudioClient [3] Initialize, [14] GetService
- *   IAudioRenderClient [3]/[4] (armed on first GetService)
+ * Not patched: any code in DivaMegaMix.exe. Denuvo-safe by construction.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
+#include <timeapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -52,6 +42,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winmm.lib")
 
 /* ASIO SDK headers (copies live in dev/asiosdk/, build with -Iasiosdk) */
 #ifndef interface
@@ -66,16 +57,18 @@ static char  g_dir[MAX_PATH] = { 0 };
 static char  g_detachPath[MAX_PATH] = { 0 };
 static volatile LONG g_sessionActive = 0;
 
-/* ---- v11 config ---- */
-static int g_asioEn     = 0;    /* 1 = ASIO bridge enabled            */
-static int g_asioBlock  = 64;   /* ASIO block size (16..1024 step 16) */
-static int g_muteMode   = 1;    /* 1 = tap-and-zero (v11), 0 = SetMute */
-static int g_handoffMs  = 0;    /* 0 = auto (measured buffer + 2ms)   */
+/* ---- v13 config ----
+ * Defaults match README: a missing/old audio_hook.txt must NOT silently
+ * downgrade the mod to the v9 behaviour, so both flags default to 1. */
+static int g_asioEn     = 1;    /* 1 = ASIO backend available            */
+static int g_asioBlock  = 64;   /* ASIO block size (16..1024 step 16)     */
+static int g_muteMode   = 1;    /* 1 = tap-and-zero (v11), 0 = SetMute    */
+static int g_handoffMs  = 0;    /* 0 = auto (measured buffer + 2ms)       */
 static char g_asioMatch[96] = "*";               /* "" or "*" = any driver */
-static int  g_exclusive2 = 0;    /* 1 = experimental EXCLUSIVE + pseudo-EC */
-static int  g_fakeClient = 0;    /* 1 = v13: own CRI's stream1 client (no engine buffer) */
+static int  g_fakeClient = 1;    /* 1 = own CRI's stream1 client (no engine buffer) */
 static int  g_outMode = 0;       /* 0 = ASIO, 1 = WASAPI exclusive, 2 = WASAPI shared */
 static volatile LONG g_woState = 0;   /* 0=off 2=starting 3=running 4=failed */
+static volatile LONG g_woReading = 0; /* WoThread is actively consuming the ring */
 static volatile LONG g_woUnder = 0;
 static volatile LONG g_woCbs   = 0;
 static volatile LONG64 g_woOut = 0;   /* frames handed to the output stream */
@@ -89,6 +82,7 @@ static LARGE_INTEGER g_qpcFreq, g_qpc0;
 static double MsNow(void)
 {
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    if (g_qpcFreq.QuadPart <= 0) return 0.0;   /* never divide by zero */
     return (double)(c.QuadPart - g_qpc0.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
 }
 
@@ -109,9 +103,17 @@ static void Log(const char* fmt, ...)
 {
     if (!g_log) return;
     SYSTEMTIME st; GetLocalTime(&st);
-    fprintf(g_log, "[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
-    fputc('\n', g_log);
+    char body[1024];
+    va_list ap; va_start(ap, fmt);
+    _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    /* one fwrite per line: the timestamp can no longer be split from its text
+       when the game thread, the ASIO callback and the watchdog log at once */
+    char line[1200];
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02u:%02u:%02u.%03u] %s\n",
+                        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
+                        (unsigned)st.wMilliseconds, body);
+    if (n > 0) fwrite(line, 1, (size_t)n, g_log);
     fflush(g_log);
 }
 
@@ -148,6 +150,7 @@ static const char* HrBrief(HRESULT hr)
 static BOOL PatchSlot(void** vtbl, int idx, void* newFn, void** outOrig)
 {
     if (!vtbl || !IsExecPtr(vtbl[idx])) return FALSE;
+    if (vtbl[idx] == newFn) return FALSE;   /* already ours -> never re-hook ourselves */
     DWORD old = 0;
     if (!VirtualProtect(&vtbl[idx], sizeof(void*), PAGE_READWRITE, &old)) return FALSE;
     if (outOrig) *outOrig = vtbl[idx];
@@ -156,6 +159,29 @@ static BOOL PatchSlot(void** vtbl, int idx, void* newFn, void** outOrig)
     VirtualProtect(&vtbl[idx], sizeof(void*), old, &tmp);
     FlushInstructionCache(GetCurrentProcess(), &vtbl[idx], sizeof(void*));
     return TRUE;
+}
+
+struct SlotPatch { int idx; void* fn; void** orig; };
+
+/* Patch an entire set of slots or none at all. A half-patched vtable used to
+ * leave slot 3 rewritten while the "patched" flag stayed 0, so the next attempt
+ * captured our own hook as the "original" and recursed until the stack died. */
+static BOOL PatchSlots(void** vtbl, const SlotPatch* list, int n)
+{
+    if (!vtbl) return FALSE;
+    for (int i = 0; i < n; i++)
+    {
+        int idx = list[i].idx;
+        if (!IsExecPtr(vtbl[idx])) return FALSE;
+        if (vtbl[idx] == list[i].fn) return FALSE;   /* already hooked elsewhere */
+    }
+    int done = 0;
+    for (; done < n; done++)
+        if (!PatchSlot(vtbl, list[done].idx, list[done].fn, list[done].orig)) break;
+    if (done == n) return TRUE;
+    for (int i = done - 1; i >= 0; i--)
+        PatchSlot(vtbl, list[i].idx, *list[i].orig, NULL);   /* roll back */
+    return FALSE;
 }
 
 /* ===================================================================== */
@@ -174,12 +200,7 @@ static volatile LONG   g_zeroTap   = 0;   /* v11: zero the game buffer after cop
 static volatile LONG   g_kicked    = 0;   /* stream1 died while bridging */
 static volatile LONG   g_asioStartReq = 0;
 static volatile LONG   g_s1BufFrames  = 0; /* measured stream1 buffer (frames) */
-
-/* ---- experimental exclusive2 (pseudo-EC) ---- */
-static HANDLE          g_s1Event = NULL;     /* stream1 SetEventHandle value */
-static volatile LONG   g_s1PeriodFrames = 0; /* exclusive periodicity (frames) */
-static volatile LONG   g_pseudoEC = 0;       /* driver thread running        */
-static volatile LONG   g_ecSetEvents = 0;    /* SetEvent count               */
+static volatile LONG   g_asioBusy     = 0; /* inside AsioFill (callback in flight) */
 
 #define S1_MAX 8
 static volatile LONG g_s1ClientN = 0;
@@ -190,24 +211,29 @@ struct RcSlot { void* rc; BYTE* ptr; UINT32 frames; };
 static volatile LONG g_s1RcN = 0;
 static RcSlot g_rcSlots[S1RC_MAX] = { 0 };
 
+/* Both tables are rings: when the game rebuilds stream1 (device switch, plug,
+   driver preemption) the newest client replaces the oldest entry instead of
+   being dropped, so the tap cannot silently stop working after 8 rebuilds. */
 static int IsS1Client(void* client)
 {
-    LONG n = g_s1ClientN; if (n > S1_MAX) n = S1_MAX;
-    for (int i = 0; i < n; i++) if (g_s1Clients[i] == client) return 1;
+    if (!client) return 0;
+    for (int i = 0; i < S1_MAX; i++) if (g_s1Clients[i] == client) return 1;
     return 0;
 }
 
 static void AddS1Client(void* client)
 {
     LONG n = InterlockedIncrement(&g_s1ClientN);
-    if (n <= S1_MAX) g_s1Clients[n - 1] = client;
-    Log("[asio] stream1 client registered: %p (total %ld)", client, n);
+    int slot = (int)((n - 1) % S1_MAX);
+    g_s1Clients[slot] = client;
+    Log("[asio] stream1 client registered: %p (total %ld, slot %d)", client, n, slot);
+    if (n > S1_MAX)
+        Log("[asio] stream1 rebuilt %ld times - oldest client entries replaced", n - S1_MAX);
 }
 
 static int RcSlotFind(void* rc)
 {
-    LONG n = g_s1RcN; if (n > S1RC_MAX) n = S1RC_MAX;
-    for (int i = 0; i < n; i++) if (g_rcSlots[i].rc == rc) return i;
+    for (int i = 0; i < S1RC_MAX; i++) if (g_rcSlots[i].rc == rc) return i;
     return -1;
 }
 
@@ -215,8 +241,11 @@ static void AddS1Rc(void* rc)
 {
     if (RcSlotFind(rc) >= 0) return;
     LONG n = InterlockedIncrement(&g_s1RcN);
-    if (n <= S1RC_MAX) { g_rcSlots[n - 1].rc = rc; g_rcSlots[n - 1].ptr = NULL; g_rcSlots[n - 1].frames = 0; }
-    Log("[asio] stream1 render-client registered: %p (total %ld)", rc, n);
+    int slot = (int)((n - 1) % S1RC_MAX);
+    g_rcSlots[slot].rc = rc;
+    g_rcSlots[slot].ptr = NULL;
+    g_rcSlots[slot].frames = 0;
+    Log("[asio] stream1 render-client registered: %p (total %ld, slot %d)", rc, n, slot);
 }
 
 /* ---- device notification logger (diagnostic) ---- */
@@ -248,7 +277,7 @@ public:
     HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) { NLogId("DEVICE_REMOVED", id, MsNow()); return S_OK; }
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow f, ERole r, LPCWSTR id) {
         (void)id;
-        Log("[notify] t=%.2fs DEFAULT_CHANGED flow=%d role=%d", MsNow(), (int)f, (int)r);
+        Log("[notify] t=%.2fms DEFAULT_CHANGED flow=%d role=%d", MsNow(), (int)f, (int)r);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR id, const PROPERTYKEY k) {
@@ -259,7 +288,7 @@ public:
         char b[400] = { 0 };
         if (id) WideCharToMultiByte(CP_ACP, 0, id, -1, b, 399, NULL, NULL);
         const char* brace = strrchr(b, '{');
-        Log("[notify] t=%.2fs PROPCHANGED key={%s,%lu} dev='%s'", MsNow(), gb, (unsigned long)k.pid, brace ? brace : b);
+        Log("[notify] t=%.2fms PROPCHANGED key={%s,%lu} dev='%s'", MsNow(), gb, (unsigned long)k.pid, brace ? brace : b);
         return S_OK;
     }
 };
@@ -271,9 +300,13 @@ static NotifyLogger* g_notifier = NULL;
 #define RING_CAP 65536            /* frames (1.49s @44.1k); power of two */
 static short* g_ring = NULL;
 static volatile LONG64 g_rw = 0, g_rr = 0;
+/* frames actually consumed by an output backend - this is the play position we
+   report through the fake IAudioClock (and it was hard-wired to 0 before) */
+static volatile LONG64 g_fakePlayed = 0;
 
 static unsigned RingAvail(void)
 {
+    if (!g_ring) return 0;
     LONG64 w = g_rw, r = g_rr;
     if (w < r) return 0;
     return (unsigned)(w - r);
@@ -281,6 +314,8 @@ static unsigned RingAvail(void)
 
 static void RingWrite(const short* src, unsigned frames)
 {
+    if (!g_ring || !src || !frames) return;   /* no ring = nothing to feed */
+    if (frames > RING_CAP) frames = RING_CAP;
     LONG64 w = g_rw;
     unsigned used = (unsigned)(w - g_rr);
     if (used + frames > RING_CAP) { InterlockedIncrement64(&g_ringDrops); return; }
@@ -294,6 +329,7 @@ static void RingWrite(const short* src, unsigned frames)
 
 static unsigned RingRead(short* dst, unsigned want)
 {
+    if (!g_ring || !dst || !want) return 0;
     LONG64 r = g_rr;
     unsigned avail = (unsigned)(g_rw - r);
     unsigned n = avail < want ? avail : want;
@@ -304,6 +340,7 @@ static unsigned RingRead(short* dst, unsigned want)
     if (n > first) memcpy(dst + (size_t)first * 2, g_ring, (size_t)(n - first) * 4);
     MemoryBarrier();
     g_rr = r + n;
+    InterlockedExchangeAdd64(&g_fakePlayed, (LONG64)n);   /* consumed == played */
     return n;
 }
 
@@ -330,6 +367,25 @@ static short*         g_tmp = NULL;      /* block*2 shorts staging (interleaved)
  *  stream straight into each channel: every 32 frames got stretched into 64
  *  samples (one octave down + half the content dropped) = the reported
  *  "shredded + pitch down" audio.  */
+/* bytes per sample for the ASIO formats we can render (0 = unsupported) */
+static int AsioTypeBytes(long t)
+{
+    switch (t)
+    {
+    case ASIOSTInt16LSB: case ASIOSTInt16MSB: return 2;
+    case ASIOSTInt24LSB: case ASIOSTInt24MSB: return 3;
+    case ASIOSTInt32LSB: case ASIOSTInt32LSB16: case ASIOSTInt32LSB18:
+    case ASIOSTInt32LSB20: case ASIOSTInt32LSB24:
+    case ASIOSTInt32MSB: case ASIOSTInt32MSB16: case ASIOSTInt32MSB18:
+    case ASIOSTInt32MSB20: case ASIOSTInt32MSB24:
+    case ASIOSTFloat32LSB: case ASIOSTFloat32MSB:
+        return 4;
+    case ASIOSTFloat64LSB: case ASIOSTFloat64MSB:
+        return 8;
+    default: return 0;
+    }
+}
+
 static void WriteSamples(void* p, long type, int ch, const short* src, unsigned got, unsigned total)
 {
     if (!p) return;
@@ -360,9 +416,12 @@ static void WriteSamples(void* p, long type, int ch, const short* src, unsigned 
         for (i = 0; i < got; i++) o[i] = src[i * 2 + ch] / 32768.0f;
         for (; i < total; i++) o[i] = 0.0f;
     } break;
-    default:
-        memset(p, 0, (size_t)total * 4);
-        break;
+    default: {
+        /* unknown / 8-byte formats: clear with the real sample width, otherwise
+           half of every frame keeps stale data and plays back as noise */
+        int b = AsioTypeBytes(type);
+        memset(p, 0, (size_t)total * (size_t)(b > 0 ? b : 4));
+    } break;
     }
 }
 
@@ -371,6 +430,7 @@ static BOOL WoStart(int exclusive);   /* v13, defined in the WASAPI-output secti
 
 static void AsioFill(long index)
 {
+    InterlockedIncrement(&g_asioBusy);   /* teardown waits for this to reach 0 */
     InterlockedIncrement(&g_asoCbs);
     long blk = g_ablock;
     unsigned got = RingRead(g_tmp, (unsigned)blk);
@@ -383,6 +443,7 @@ static void AsioFill(long index)
         WriteSamples(g_abufs[c].buffers[index], g_aci[c].type, c, g_tmp, got, (unsigned)blk);
     if (g_apostOut && g_asio) g_asio->outputReady();
     FakePoke();   /* v13: top up CRI's fake client from the real output clock */
+    InterlockedDecrement(&g_asioBusy);
 }
 
 static ASIOTime* cbBufferSwitchTimeInfo(ASIOTime* params, long index, ASIOBool direct)
@@ -417,17 +478,61 @@ static long cbAsioMessage(long selector, long value, void* msg, double* opt)
 
 /* ---------------- legacy session mute (mute_mode = 0) ---------------- */
 
+/* Legacy mute path (mute_mode = 0) and the boot-time stale-mute cleanup.
+ *
+ * v13.1: this no longer goes through stream1's IAudioClient. With
+ * fake_client = 1 that object never had a real Initialize(), so
+ * GetService(ISimpleAudioVolume) returned AUDCLNT_E_NOT_INITIALIZED (0x88890001)
+ * and the promised "clear the v10d mute residue" silently did nothing.
+ * We now walk this process's own sessions on the default endpoint, which works
+ * with or without the fake client (same approach as session_tool --unmute). */
 static BOOL MuteSession(BOOL mute)
 {
-    if (g_s1ClientN < 1) return FALSE;
-    IAudioClient* c = (IAudioClient*)g_s1Clients[0];
-    ISimpleAudioVolume* vol = NULL;
-    HRESULT hr = oGS ? oGS(c, __uuidof(ISimpleAudioVolume), (void**)&vol) : E_FAIL;
-    if (FAILED(hr) || !vol) { Log("[asio] GetService(ISimpleAudioVolume) hr=0x%08X", (unsigned)hr); return FALSE; }
-    hr = vol->SetMute(mute, NULL);
-    vol->Release();
-    if (FAILED(hr)) { Log("[asio] SetMute(%d) hr=0x%08X", (int)mute, (unsigned)hr); return FALSE; }
-    return TRUE;
+    IMMDeviceEnumerator* en = NULL;
+    IMMDevice* dev = NULL;
+    IAudioSessionManager2* sm = NULL;
+    IAudioSessionEnumerator* ses = NULL;
+    BOOL ok = FALSE;
+
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en)
+        return FALSE;
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev)) || !dev) goto done;
+    if (FAILED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&sm)) || !sm) goto done;
+    if (FAILED(sm->GetSessionEnumerator(&ses)) || !ses) goto done;
+
+    int count = 0;
+    if (FAILED(ses->GetCount(&count))) goto done;
+    for (int i = 0; i < count; i++)
+    {
+        IAudioSessionControl* ctl = NULL;
+        if (FAILED(ses->GetSession(i, &ctl)) || !ctl) continue;
+        IAudioSessionControl2* ctl2 = NULL;
+        if (SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2)) && ctl2)
+        {
+            DWORD spid = 0;
+            ctl2->GetProcessId(&spid);
+            if (spid == GetCurrentProcessId())   /* never touch other apps / system sounds */
+            {
+                ISimpleAudioVolume* vol = NULL;
+                if (SUCCEEDED(ctl2->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&vol)) && vol)
+                {
+                    if (SUCCEEDED(vol->SetMute(mute, NULL))) ok = TRUE;
+                    vol->Release();
+                }
+            }
+            ctl2->Release();
+        }
+        ctl->Release();
+    }
+done:
+    if (ses) ses->Release();
+    if (sm) sm->Release();
+    if (dev) dev->Release();
+    if (en) en->Release();
+    if (!ok) Log("[mute] no audio session of this process found (pid=%lu)",
+                 (unsigned long)GetCurrentProcessId());
+    return ok;
 }
 
 /* ---------------- driver load / prepare / teardown ---------------- */
@@ -469,8 +574,17 @@ static BOOL AsioLoadDriver(const char* match)
 
 static long AsioChooseBlock(long want, long mn, long mx, long pr, long gr)
 {
-    long block = want > 0 ? want : pr;
-    if (gr < 0) { long b = mn; while (b < block && b < mx) b <<= 1; block = b; }
+    if (mn <= 0) mn = 16;            /* some drivers report minBuffSize = 0 */
+    if (mx < mn) mx = mn;
+    long block = want > 0 ? want : (pr > 0 ? pr : mn);
+    if (gr < 0)
+    {
+        /* power-of-two granularity. Starting from 0 (or a bad min) used to
+           shift left forever and hang the worker thread. */
+        long b = mn;
+        for (int guard = 0; b < block && b < mx && guard < 32; guard++) b <<= 1;
+        block = b;
+    }
     else if (gr > 0) block = mn + ((block - mn + gr - 1) / gr) * gr;
     if (block < mn) block = mn;
     if (block > mx) block = mx;
@@ -481,6 +595,7 @@ static long AsioChooseBlock(long want, long mn, long mx, long pr, long gr)
  * Returns TRUE when ready to be started (buffers created, silence pre-filled). */
 static BOOL AsioPrepare(void)
 {
+    int buffers = 0;
     if (!AsioLoadDriver(g_asioMatch)) return FALSE;
 
     if (g_asio->init((void*)GetDesktopWindow()) != ASIOTrue)
@@ -488,7 +603,7 @@ static BOOL AsioPrepare(void)
         char e[124] = { 0 };
         g_asio->getErrorMessage(e);
         Log("[asio] init failed: %s", e);
-        return FALSE;
+        goto fail;                     /* init() already succeeded -> must release */
     }
     char nm[64] = { 0 };
     g_asio->getDriverName(nm);
@@ -496,11 +611,12 @@ static BOOL AsioPrepare(void)
     if (g_asio->getChannels(&nin, &nout) != ASE_OK || nout < 2)
     {
         Log("[asio] channels in=%ld out=%ld - need >=2 outputs", nin, nout);
-        return FALSE;
+        goto fail;
     }
     long mn = 0, mx = 0, pr = 0, gr = 0;
-    if (g_asio->getBufferSize(&mn, &mx, &pr, &gr) != ASE_OK) { Log("[asio] getBufferSize failed"); return FALSE; }
+    if (g_asio->getBufferSize(&mn, &mx, &pr, &gr) != ASE_OK) { Log("[asio] getBufferSize failed"); goto fail; }
     long block = AsioChooseBlock(g_asioBlock, mn, mx, pr, gr);
+    if (block < 16) { Log("[asio] !! unusable ASIO block size %ld", block); goto fail; }
 
     ASIOSampleRate sr = 0;
     g_asio->getSampleRate(&sr);
@@ -511,7 +627,7 @@ static BOOL AsioPrepare(void)
     if (fabs(sr - 44100.0) > 1.0)
     {
         Log("[asio] !! sample rate %g != 44100 - refusing to bridge (avoids pitch shift)", sr);
-        return FALSE;
+        goto fail;
     }
 
     if (g_asio->outputReady() == ASE_OK) g_apostOut = 1;
@@ -525,7 +641,8 @@ static BOOL AsioPrepare(void)
     g_acbs.asioMessage = cbAsioMessage;
     g_acbs.bufferSwitchTimeInfo = cbBufferSwitchTimeInfo;
 
-    if (g_asio->createBuffers(g_abufs, 2, block, &g_acbs) != ASE_OK) { Log("[asio] createBuffers failed"); return FALSE; }
+    if (g_asio->createBuffers(g_abufs, 2, block, &g_acbs) != ASE_OK) { Log("[asio] createBuffers failed"); goto fail; }
+    buffers = 1;
     g_ablock = block;
 
     for (int c = 0; c < 2; c++)
@@ -533,7 +650,16 @@ static BOOL AsioPrepare(void)
         memset(&g_aci[c], 0, sizeof(ASIOChannelInfo));
         g_aci[c].channel = c;
         g_aci[c].isInput = ASIOFalse;
-        g_asio->getChannelInfo(&g_aci[c]);
+        if (g_asio->getChannelInfo(&g_aci[c]) != ASE_OK)
+        {
+            Log("[asio] !! getChannelInfo(ch%ld) failed - refusing to run silent", c);
+            goto fail;
+        }
+        if (!AsioTypeBytes(g_aci[c].type))
+        {
+            Log("[asio] !! unsupported sample type %ld on ch%ld - refusing", g_aci[c].type, c);
+            goto fail;
+        }
     }
     Log("[asio] out ch0 type=%ld '%s' | ch1 type=%ld '%s'", g_aci[0].type, g_aci[0].name, g_aci[1].type, g_aci[1].name);
 
@@ -542,7 +668,7 @@ static BOOL AsioPrepare(void)
         Log("[asio] latencies in=%ld out=%ld frames (%.2f / %.2f ms)", il, ol, il * 1000.0 / 44100.0, ol * 1000.0 / 44100.0);
 
     if (!g_tmp) g_tmp = (short*)malloc((size_t)block * 2 * sizeof(short));
-    if (!g_tmp) { Log("[asio] staging alloc failed"); return FALSE; }
+    if (!g_tmp) { Log("[asio] staging alloc failed"); goto fail; }
 
     /* pre-fill both halves with silence (spec: at least index 1) */
     for (long h = 0; h < 2; h++)
@@ -550,27 +676,60 @@ static BOOL AsioPrepare(void)
             WriteSamples(g_abufs[c].buffers[h], g_aci[c].type, c, g_tmp, 0, (unsigned)block);
 
     return TRUE;
+
+fail:
+    /* every failure path ends here: a driver left init()ed stays claimed by
+       this process for its whole lifetime (DAWs then see "device in use") */
+    Log("[asio] prepare failed -> releasing the driver (device becomes free again)");
+    if (g_asio)
+    {
+        g_asio->stop();
+        if (buffers) g_asio->disposeBuffers();
+        g_asio->Release();
+        g_asio = NULL;
+    }
+    g_apostOut = 0;
+    return FALSE;
 }
 
 static void AsioTeardown(void)
 {
     if (!g_asio) return;
     g_asio->stop();
-    g_asio->disposeBuffers();
+    /* ASIO does not promise that bufferSwitch has returned when stop() does:
+       freeing the buffers while the callback is still running is a UAF, and the
+       "device kicked" path is exactly when it is most likely. */
+    for (int i = 0; i < 200 && g_asioBusy; i++) Sleep(1);
+    if (g_asioBusy)
+        Log("[asio] !! callback still in flight after 200 ms - skipping disposeBuffers (leaking, not crashing)");
+    else
+        g_asio->disposeBuffers();
     g_asio->Release();
     g_asio = NULL;
     g_apostOut = 0;
 }
 
-/* rollback: make the WASAPI path audible again, drop ASIO, stop trying */
+/* rollback: drop ASIO and make sure the game still has an audible path */
 static void AsioRollback(const char* why)
 {
     Log("[asio] ROLLBACK: %s", why);
-    InterlockedExchange(&g_zeroTap, 0);              /* game audio returns */
+    InterlockedExchange(&g_zeroTap, 0);              /* game audio returns (tap path) */
     InterlockedExchange(&g_tapOn, 0);                /* stop copying to the ring */
     if (g_muted) { MuteSession(FALSE); InterlockedExchange(&g_muted, 0); }
     AsioTeardown();
     InterlockedExchange(&g_asioState, 4);
+    InterlockedExchange(&g_asioStartReq, 0);         /* allow a later retry */
+
+    if (g_fakeClient)
+    {
+        /* With the fake client there is NO real WASAPI stream behind us, so the
+           old "game audio returns via WASAPI" is impossible: leaving it at that
+           meant permanent silence. Switch to our own shared stream instead. */
+        Log("[asio] fake client: no engine stream exists -> switching to the WASAPI shared backend");
+        if (!WoStart(0)) Log("[out] !! shared fallback failed as well - no audio path left");
+    }
+    else
+        Log("[asio] WASAPI path is audible again (v11 behaviour)");
 }
 
 /* ---------------- start worker ---------------- */
@@ -607,11 +766,14 @@ static DWORD WINAPI AsioStartThread(LPVOID)
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     InterlockedExchange(&g_asioState, 2);
 
-    Log("[asio] v11 worker up - waiting for the game's audio tap to run steadily");
+    Log("[asio] worker up - waiting for the game's audio tap to run steadily");
     if (!WaitForTapSteady())
     {
-        Log("[asio] !! tap never reached steady real-time (30s) - staying on WASAPI path");
+        Log("[asio] !! tap never reached steady real-time (30s) - keeping the current path");
         InterlockedExchange(&g_asioState, 4);
+        InterlockedExchange(&g_asioStartReq, 0);
+        if (g_fakeClient && g_woState != 3)
+            if (!WoStart(0)) Log("[out] !! shared fallback failed - no audio");
         return 0;
     }
     Log("[handoff] tap steady (taps=%lld)", (long long)g_tapFrames);
@@ -619,6 +781,7 @@ static DWORD WINAPI AsioStartThread(LPVOID)
     if (!AsioPrepare())
     {
         InterlockedExchange(&g_asioState, 4);
+        InterlockedExchange(&g_asioStartReq, 0);   /* a later retry must be possible */
         if (g_fakeClient)
         {
             Log("[asio] !! prepare failed -> falling back to WASAPI shared output");
@@ -628,43 +791,51 @@ static DWORD WINAPI AsioStartThread(LPVOID)
         return 0;
     }
 
-    /* handoff: point the reader at the newest write (the frame the game will
-       stop on), then silence the game side and let its engine queue drain. */
-    RingResyncToLatest(0);
-
-    long handoffMs = g_handoffMs;
-    if (handoffMs <= 0)
+    if (!g_fakeClient)
     {
-        long bf = g_s1BufFrames;
-        if (bf < 100) bf = 970;
-        handoffMs = (long)(bf * 1000.0 / 44100.0) + 2;
-    }
-    if (handoffMs < 5) handoffMs = 5;
-    if (handoffMs > 150) handoffMs = 150;
+        /* legacy tap path only: point the reader at the newest write (the frame
+           the game will stop on), then silence the game side and let its engine
+           queue drain. With the fake client there is no queue and no real
+           stream, so this whole dance is skipped (v13.0 ran it anyway and threw
+           away up to 10 ms of already mixed audio on every start). */
+        RingResyncToLatest(0);
 
-    if (g_muteMode != 0)
-    {
-        InterlockedExchange(&g_zeroTap, 1);
-        Log("[handoff] mode=tap-zero: zeroing starts; waiting %ld ms for the engine queue to drain", handoffMs);
+        long handoffMs = g_handoffMs;
+        if (handoffMs <= 0)
+        {
+            long bf = g_s1BufFrames;
+            if (bf < 100) bf = 970;
+            handoffMs = (long)(bf * 1000.0 / 44100.0) + 2;
+        }
+        if (handoffMs < 5) handoffMs = 5;
+        if (handoffMs > 150) handoffMs = 150;
+
+        if (g_muteMode != 0)
+        {
+            InterlockedExchange(&g_zeroTap, 1);
+            Log("[handoff] mode=tap-zero: zeroing starts; waiting %ld ms for the engine queue to drain", handoffMs);
+        }
+        else
+        {
+            if (!MuteSession(TRUE))
+            {
+                Log("[asio] !! mute failed -> rolling back to avoid double audio");
+                AsioRollback("mute failed");
+                return 0;
+            }
+            InterlockedExchange(&g_muted, 1);
+            Log("[handoff] mode=set-mute: session muted; waiting %ld ms", handoffMs);
+        }
+
+        /* precise wait: Sleep(1) up to the last 2 ms, then spin */
+        {
+            double tEnd = MsNow() + (double)handoffMs;
+            while (MsNow() < tEnd - 2.0) Sleep(1);
+            while (MsNow() < tEnd) { YieldProcessor(); }
+        }
     }
     else
-    {
-        if (!MuteSession(TRUE))
-        {
-            Log("[asio] !! mute failed -> rolling back to avoid double audio");
-            AsioRollback("mute failed");
-            return 0;
-        }
-        InterlockedExchange(&g_muted, 1);
-        Log("[handoff] mode=set-mute: session muted; waiting %ld ms", handoffMs);
-    }
-
-    /* precise wait: Sleep(1) up to the last 2 ms, then spin */
-    {
-        double tEnd = MsNow() + (double)handoffMs;
-        while (MsNow() < tEnd - 2.0) Sleep(1);
-        while (MsNow() < tEnd) { YieldProcessor(); }
-    }
+        Log("[handoff] fake client: no engine queue to drain, starting ASIO directly");
 
     if (g_asio->start() != ASE_OK)
     {
@@ -676,15 +847,15 @@ static DWORD WINAPI AsioStartThread(LPVOID)
     InterlockedExchange(&g_asioState, 3);
     Log("[handoff] ASIO started - output resumed seamlessly (block=%ld). monitoring...", g_ablock);
 
-    /* monitor: kick / stall / runaway underruns */
+    /* monitor: kick / stall / runaway underruns (runs until the process ends) */
     int stall = 0, undFail = 0;
     LONG last = g_asoCbs, lastUnd = g_underruns;
-    for (int i = 1; i <= 86400; i++)
+    for (long long i = 1; i > 0; i++)
     {
         Sleep(1000);
         if (g_kicked)
         {
-            AsioRollback("stream1 was invalidated (kick) - game audio returns via WASAPI");
+            AsioRollback("stream1 was invalidated (kick)");
             return 0;
         }
         if (g_asoCbs == last)
@@ -711,7 +882,7 @@ static DWORD WINAPI AsioStartThread(LPVOID)
         }
         else undFail = 0;
         if (i <= 20 || (i % 60) == 0)
-            Log("[asio] t=%ds cbs=%ld und=%ld avail=%u zeroTap=%ld muted=%ld",
+            Log("[asio] t=%llds cbs=%ld und=%ld avail=%u zeroTap=%ld muted=%ld",
                 i, g_asoCbs, g_underruns, RingAvail(), g_zeroTap, g_muted);
     }
     return 0;
@@ -740,7 +911,14 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_GetBuffer(void* self, UINT32 frames, BY
     if (SUCCEEDED(hr) && g_tapOn && frames > 0 && ppData && *ppData)
     {
         int si = RcSlotFind(self);
-        if (si >= 0) { g_rcSlots[si].ptr = *ppData; g_rcSlots[si].frames = frames; }
+        if (si >= 0)
+        {
+            /* length first, pointer last: the release hook uses ptr != NULL as
+               its gate, so it can never pair a new pointer with an old length */
+            g_rcSlots[si].frames = frames;
+            MemoryBarrier();
+            g_rcSlots[si].ptr = *ppData;
+        }
     }
     return hr;
 }
@@ -753,20 +931,38 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_ReleaseBuffer(void* self, UINT32 frames
        when the bridge runs in tap-and-zero mode, wipe the game buffer right
        after the copy so the WASAPI engine plays silence (no SetMute, no
        driver reconfig, no double audio). */
-    if (g_tapOn && frames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT))
+    if (g_tapOn && frames > 0)
     {
         int si = RcSlotFind(self);
-        if (si >= 0 && g_rcSlots[si].ptr && g_rcSlots[si].frames > 0)
+        if (si >= 0)
         {
             unsigned n = frames;
-            if (n > g_rcSlots[si].frames) n = g_rcSlots[si].frames;
-            RingWrite((const short*)g_rcSlots[si].ptr, n);
-            InterlockedExchangeAdd64(&g_tapFrames, (LONG64)n);
-            if (g_zeroTap)
+            if (g_rcSlots[si].frames > 0 && n > g_rcSlots[si].frames) n = g_rcSlots[si].frames;
+            if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
             {
-                memset(g_rcSlots[si].ptr, 0, (size_t)n * 4);
-                InterlockedExchangeAdd64(&g_zeroed, (LONG64)n);
+                /* CRI really does send this (log: ReleaseBuffer(441, flags=0x2)).
+                   Skipping it used to starve the ring during silence, which the
+                   monitor then saw as "runaway underruns" and rolled back. */
+                static const short zeros[512 * 2] = { 0 };
+                unsigned left = n;
+                while (left)
+                {
+                    unsigned c = left > 512 ? 512u : left;
+                    RingWrite(zeros, c);
+                    left -= c;
+                }
             }
+            else if (g_rcSlots[si].ptr)
+            {
+                RingWrite((const short*)g_rcSlots[si].ptr, n);
+                if (g_zeroTap)
+                {
+                    memset(g_rcSlots[si].ptr, 0, (size_t)n * 4);
+                    InterlockedExchangeAdd64(&g_zeroed, (LONG64)n);
+                }
+            }
+            else n = 0;
+            InterlockedExchangeAdd64(&g_tapFrames, (LONG64)n);
         }
     }
 
@@ -807,26 +1003,26 @@ static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* self, REFIID riid
             InterlockedExchange(&g_tapOn, 1);
         }
 
-        if (!g_rcPatched)
+        if (!g_rcPatched && InterlockedCompareExchange(&g_rcPatched, 1, 0) == 0)
         {
             void** vt = *(void***)*ppv;
-            if (vt && IsExecPtr(vt[3]) && IsExecPtr(vt[4]))
+            const SlotPatch list[] = {
+                { 3, (void*)&Hook_RC_GetBuffer,     (void**)&oRCGB },
+                { 4, (void*)&Hook_RC_ReleaseBuffer, (void**)&oRCRB },
+            };
+            if (vt && PatchSlots(vt, list, 2))
+                Log("[gs] RC vtable patched (tap + zero armed)");
+            else
             {
-                if (PatchSlot(vt, 3, (void*)&Hook_RC_GetBuffer, (void**)&oRCGB) &&
-                    PatchSlot(vt, 4, (void*)&Hook_RC_ReleaseBuffer, (void**)&oRCRB))
-                {
-                    g_rcPatched = 1;
-                    Log("[gs] RC vtable patched (tap + zero armed)");
-                }
-                else Log("[gs] !! RC patch failed");
+                InterlockedExchange(&g_rcPatched, 0);
+                Log("[gs] !! RC patch failed (any partial slot was rolled back)");
             }
-            else Log("[gs] !! RC slots not executable - skipped");
         }
     }
     return hr;
 }
 
-/* ------------- exclusive2: SetEventHandle hook + pseudo-EC driver ------------- */
+/* ------------- SetEventHandle (only used by the fake client) ------------- */
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_SEH)(IAudioClient* self, HANDLE hEvent);
 static PFN_SEH oSEH = NULL;
@@ -834,35 +1030,7 @@ static PFN_SEH oSEH = NULL;
 static HRESULT STDMETHODCALLTYPE Hook_SetEventHandle(IAudioClient* self, HANDLE hEvent)
 {
     if (FakeIsSelf(self)) return FakeSetEventHandle(self, hEvent);
-
-    HRESULT hr = oSEH ? oSEH(self, hEvent) : E_FAIL;
-    if (SUCCEEDED(hr) && g_exclusive2 && IsS1Client(self)) {
-        g_s1Event = hEvent;
-        Log("[ec] stream1 event handle = %p", hEvent);
-    }
-    return hr;
-}
-
-/* Poll the exclusive buffer; when a full period of room is free, poke CRI's
-   event so it fills. This replaces engine-driven EVENTCALLBACK timing with
-   device-consumption-driven timing (the clock mismatch disappears). */
-static DWORD WINAPI PseudoECThread(LPVOID)
-{
-    Log("[ec] pseudo-EC driver started");
-    while (g_pseudoEC) {
-        IAudioClient* c = (IAudioClient*)g_s1Clients[0];
-        if (!c || !g_s1Event || g_s1BufFrames <= 0) { Sleep(5); continue; }
-        UINT32 padding = 0;
-        if (FAILED(c->GetCurrentPadding(&padding))) { Sleep(5); continue; }
-        UINT32 avail = (UINT32)g_s1BufFrames - padding;
-        if (avail >= (UINT32)g_s1PeriodFrames) {
-            if (SetEvent(g_s1Event)) InterlockedIncrement(&g_ecSetEvents);
-            Sleep(0);
-        } else {
-            Sleep(0);
-        }
-    }
-    return 0;
+    return oSEH ? oSEH(self, hEvent) : E_FAIL;
 }
 
 /* ===================================================================== */
@@ -934,7 +1102,16 @@ public:
     {
         if (!pp) return E_POINTER;
         if (n > FAKE_FRAMES) { InterlockedIncrement(&g_fakeGbFail); return (HRESULT)0x88890006; }
-        if (RingAvail() + n > FAKE_FRAMES) { InterlockedIncrement(&g_fakeGbFail); return (HRESULT)0x88890006; }
+        /* Back-pressure: give the consumer a few ms to drain instead of
+           answering "buffer too large" (an error with a different meaning that
+           only worked because CRI tolerates it). This runs on CRI's mixing
+           thread, never on a realtime callback, so a short wait is safe. */
+        for (int i = 0; i < 5 && RingAvail() + n > FAKE_FRAMES; i++) Sleep(1);
+        if (RingAvail() + n > FAKE_FRAMES)
+        {
+            InterlockedIncrement(&g_fakeGbFail);
+            return (HRESULT)0x88890006;   /* AUDCLNT_E_BUFFER_TOO_LARGE */
+        }
         *pp = (BYTE*)g_fake.stage;
         LONG k = InterlockedIncrement(&m_calls);
         if (k <= 10) Log("[fake-rc] GetBuffer(%u) avail=%u", n, RingAvail());
@@ -959,7 +1136,6 @@ private:
 };
 
 /* ---- our IAudioClock ---- */
-static volatile LONG64 g_fakePlayed = 0;
 static const GUID kIID_IAudioClock =
 { 0xCD63314F, 0x3FD1, 0x4A1F, { 0xBA, 0x1B, 0x28, 0xED, 0x6E, 0xF1, 0xF6, 0x57 } };
 
@@ -985,8 +1161,9 @@ public:
     { if (!f) return E_POINTER; *f = 44100; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPosition(UINT64* pos, UINT64* qpc) override
     {
-        if (pos) *pos = (UINT64)g_fakePlayed;
-        if (qpc) *qpc = 0;
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        if (pos) *pos = (UINT64)g_fakePlayed;      /* frames really consumed */
+        if (qpc) *qpc = (UINT64)c.QuadPart;        /* matching QPC timestamp   */
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetCharacteristics(DWORD* c) override
@@ -1050,26 +1227,41 @@ static DWORD WINAPI FakeDriverThread(LPVOID)
     Log("[fake] driver up (frames=%u low=%u)", (unsigned)FAKE_FRAMES, (unsigned)FAKE_LOW);
     while (g_fake.running)
     {
-        if (g_asioState == 3 || g_woState == 3)
+        LONG as = g_asioState, ws = g_woState;
+        if (as == 3 || ws == 3)
         {
-            /* ASIO gives us a 1.45 ms callback to pace CRI from; the WASAPI stream
-               can have a 20+ ms period, so there we must top the queue up here as
-               well (the ring has ~10 ms of slack, so 1 ms polling is safe). */
-            if (g_woState == 3) { FakePoke(); Sleep(1); }
+            /* A real output clock drives us now. ASIO gives us a 1.45 ms callback
+               to pace CRI from; the WASAPI stream can have a 20+ ms period, so
+               there we must top the queue up here as well (the ring has ~10 ms
+               of slack, so 1 ms polling is safe). */
+            if (ws == 3) { FakePoke(); Sleep(1); }
             else Sleep(20);
-            static ULONGLONG last = 0;
-            ULONGLONG now = GetTickCount64();
-            if (now - last >= 5000)
+            if (ws != 0)
             {
-                last = now;
-                Log("[out] cbs=%ld und=%ld avail=%u taps=%lld gbfail=%ld asio=%ld wo=%ld",
-                    g_woCbs, g_woUnder, RingAvail(), (long long)g_tapFrames, g_fakeGbFail,
-                    g_asioState, g_woState);
+                static ULONGLONG last = 0;
+                ULONGLONG now = GetTickCount64();
+                if (now - last >= 5000)
+                {
+                    last = now;
+                    Log("[out] cbs=%ld und=%ld avail=%u taps=%lld gbfail=%ld asio=%ld wo=%ld",
+                        g_woCbs, g_woUnder, RingAvail(), (long long)g_tapFrames, g_fakeGbFail,
+                        as, ws);
+                }
             }
             continue;
         }
-        /* no consumer yet (ASIO still starting, or ASIO off): drain at real time
-           so CRI keeps a sane clock and the game never stalls */
+        if (g_woReading)
+        {
+            /* A consumer is already reading the ring. Draining here as well would
+               hand the same frames to two consumers (audible repeats). Note that
+               "starting" (state 2) is NOT such a case: WoThread only begins to
+               read after Start() succeeded, and the drain is what keeps CRI's
+               clock alive while ASIO waits for the tap to become steady. */
+            Sleep(2);
+            continue;
+        }
+        /* nothing running and nothing starting: drain at real time so CRI keeps
+           a sane clock and the game never stalls on a full queue */
         Sleep(5);
         unsigned a = RingAvail();
         unsigned n = a >= FAKE_CHUNK ? FAKE_CHUNK / 2 : a;
@@ -1137,12 +1329,22 @@ static HRESULT STDMETHODCALLTYPE Fake_Start(IAudioClient* s)
 }
 static HRESULT STDMETHODCALLTYPE Fake_Stop(IAudioClient* s)
 {
-    if (FakeIsSelf(s)) { InterlockedExchange(&g_fake.running, 0); Log("[fake] Stop()"); return S_OK; }
+    if (FakeIsSelf(s))
+    {
+        InterlockedExchange(&g_fake.running, 0);
+        RingResyncToLatest(0);   /* the next song must not start with old audio */
+        Log("[fake] Stop()");
+        return S_OK;
+    }
     return oStop ? oStop(s) : E_FAIL;
 }
 static HRESULT STDMETHODCALLTYPE Fake_Reset(IAudioClient* s)
 {
-    if (FakeIsSelf(s)) return S_OK;
+    if (FakeIsSelf(s))
+    {
+        RingResyncToLatest(0);   /* restart/seek: drop up to 10 ms of stale audio */
+        return S_OK;
+    }
     return oReset ? oReset(s) : E_FAIL;
 }
 
@@ -1167,20 +1369,34 @@ static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
 
     if (!g_fakePatched)
     {
-        void** vt = *(void***)self;
-        BOOL ok =
-            PatchSlot(vt,  4, (void*)&Fake_GetBufferSize,    (void**)&oGBS)  &&
-            PatchSlot(vt,  5, (void*)&Fake_GetStreamLatency, (void**)&oGLat) &&
-            PatchSlot(vt,  6, (void*)&Fake_GetCurrentPadding,(void**)&oGPad) &&
-            PatchSlot(vt,  7, (void*)&Fake_IsFormatSupported,(void**)&oIsF)  &&
-            PatchSlot(vt,  8, (void*)&Fake_GetMixFormat,     (void**)&oGMF)  &&
-            PatchSlot(vt,  9, (void*)&Fake_GetDevicePeriod,  (void**)&oGDP)  &&
-            PatchSlot(vt, 10, (void*)&Fake_Start,            (void**)&oStart)&&
-            PatchSlot(vt, 11, (void*)&Fake_Stop,             (void**)&oStop) &&
-            PatchSlot(vt, 12, (void*)&Fake_Reset,            (void**)&oReset);
-        InterlockedExchange(&g_fakePatched, ok ? 1 : 0);
-        Log("[fake] vtable slots 4..12 patched: %s", ok ? "OK" : "FAIL");
-        if (!ok) return E_FAIL;
+        if (InterlockedCompareExchange(&g_fakePatched, 1, 0) == 0)
+        {
+            void** vt = *(void***)self;
+            const SlotPatch list[] = {
+                {  4, (void*)&Fake_GetBufferSize,     (void**)&oGBS   },
+                {  5, (void*)&Fake_GetStreamLatency,  (void**)&oGLat  },
+                {  6, (void*)&Fake_GetCurrentPadding, (void**)&oGPad  },
+                {  7, (void*)&Fake_IsFormatSupported, (void**)&oIsF   },
+                {  8, (void*)&Fake_GetMixFormat,      (void**)&oGMF   },
+                {  9, (void*)&Fake_GetDevicePeriod,   (void**)&oGDP   },
+                { 10, (void*)&Fake_Start,             (void**)&oStart },
+                { 11, (void*)&Fake_Stop,              (void**)&oStop  },
+                { 12, (void*)&Fake_Reset,             (void**)&oReset },
+            };
+            if (!vt || !PatchSlots(vt, list, 9))
+            {
+                InterlockedExchange(&g_fakePatched, 0);   /* slots already rolled back */
+                Log("[fake] !! vtable patch failed (all slots rolled back)");
+                return E_FAIL;
+            }
+            Log("[fake] vtable slots 4..12 patched: OK");
+        }
+        else
+        {
+            /* another thread is patching right now */
+            for (int i = 0; i < 100 && !g_fakePatched; i++) Sleep(1);
+            if (!g_fakePatched) { Log("[fake] !! concurrent patch did not finish"); return E_FAIL; }
+        }
     }
 
     /* only now is it safe for the hooks to treat this client as ours */
@@ -1209,20 +1425,89 @@ static int                 g_woCh     = 2;   /* output channel count */
 static volatile LONG       g_woRun    = 0;
 static volatile LONG       g_woAlive  = 0;   /* WoThread is inside its loop */
 
+/* ---- resampler (only active when the endpoint is not 44.1 kHz) ----
+ * CRI always hands us 44.1 kHz. A 48 kHz endpoint would otherwise play
+ * everything 8.8 % fast (~1.5 semitones up) - which is exactly what v13.0 did,
+ * because only the ASIO path had a sample-rate guard. Linear interpolation is
+ * plenty for such a small ratio and costs one frame of latency. */
+static double g_rsStep = 1.0;          /* source frames per output frame */
+static double g_rsFrac = 0.0;
+static short  g_rsCur[2] = { 0, 0 };
+static short  g_rsNext[2] = { 0, 0 };
+static int    g_rsPrimed = 0, g_rsHasNext = 0;
+static short  g_rsBuf[1024 * 2];
+static unsigned g_rsN = 0, g_rsI = 0;
+static short  g_rsOut[2048 * 2];
+
+static void RsReset(void)
+{
+    g_rsStep = 1.0; g_rsFrac = 0.0; g_rsPrimed = 0; g_rsHasNext = 0;
+    g_rsN = g_rsI = 0;
+    g_rsCur[0] = g_rsCur[1] = g_rsNext[0] = g_rsNext[1] = 0;
+}
+
+static BOOL RsNext(short* out)
+{
+    if (g_rsI >= g_rsN)
+    {
+        g_rsN = RingRead(g_rsBuf, 1024);
+        g_rsI = 0;
+        if (!g_rsN) return FALSE;
+    }
+    out[0] = g_rsBuf[g_rsI * 2];
+    out[1] = g_rsBuf[g_rsI * 2 + 1];
+    g_rsI++;
+    return TRUE;
+}
+
+/* pull n output frames as interleaved int16 stereo */
+static unsigned RsPull(short* dst, unsigned n)
+{
+    if (g_rsStep == 1.0) return RingRead(dst, n);   /* fast path: no resampling */
+
+    unsigned produced = 0;
+    while (produced < n)
+    {
+        if (!g_rsPrimed)
+        {
+            if (!RsNext(g_rsCur)) break;
+            g_rsPrimed = 1;
+            g_rsFrac = 0.0;
+        }
+        if (!g_rsHasNext)
+        {
+            if (!RsNext(g_rsNext)) break;
+            g_rsHasNext = 1;
+        }
+        double f = g_rsFrac;
+        dst[produced * 2]     = (short)(g_rsCur[0] + (g_rsNext[0] - g_rsCur[0]) * f);
+        dst[produced * 2 + 1] = (short)(g_rsCur[1] + (g_rsNext[1] - g_rsCur[1]) * f);
+        produced++;
+        g_rsFrac += g_rsStep;
+        while (g_rsFrac >= 1.0)
+        {
+            g_rsCur[0] = g_rsNext[0];
+            g_rsCur[1] = g_rsNext[1];
+            g_rsFrac -= 1.0;
+            if (!RsNext(g_rsNext)) { g_rsHasNext = 0; break; }
+        }
+    }
+    return produced;
+}
+
 static void WoFill16(BYTE* p, UINT32 n)
 {
-    static short tmp[2048 * 2];
     short* o = (short*)p;
     UINT32 done = 0, shortage = 0;
     while (done < n)
     {
         UINT32 c = n - done; if (c > 2048) c = 2048;
-        unsigned got = RingRead(tmp, c);
+        unsigned got = RsPull(g_rsOut, c);
         for (UINT32 i = 0; i < c; i++)
         {
             short* d = o + (size_t)(done + i) * g_woCh;
-            short l = (i < got) ? tmp[i * 2] : 0;
-            short r = (i < got) ? tmp[i * 2 + 1] : 0;
+            short l = (i < got) ? g_rsOut[i * 2] : 0;
+            short r = (i < got) ? g_rsOut[i * 2 + 1] : 0;
             for (int ch = 0; ch < g_woCh; ch++) d[ch] = (ch == 0) ? l : (ch == 1 ? r : 0);
         }
         if (got < c) shortage += c - got;
@@ -1233,19 +1518,18 @@ static void WoFill16(BYTE* p, UINT32 n)
 
 static void WoFillFloat(BYTE* p, UINT32 n)
 {
-    static short tmp[2048 * 2];
     float* o = (float*)p;
     UINT32 done = 0, shortage = 0;
     const float k = 1.0f / 32768.0f;
     while (done < n)
     {
         UINT32 c = n - done; if (c > 2048) c = 2048;
-        unsigned got = RingRead(tmp, c);
+        unsigned got = RsPull(g_rsOut, c);
         for (UINT32 i = 0; i < c; i++)
         {
             float* d = o + (size_t)(done + i) * g_woCh;
-            float l = (i < got) ? (float)tmp[i * 2] * k : 0.0f;
-            float r = (i < got) ? (float)tmp[i * 2 + 1] * k : 0.0f;
+            float l = (i < got) ? (float)g_rsOut[i * 2] * k : 0.0f;
+            float r = (i < got) ? (float)g_rsOut[i * 2 + 1] * k : 0.0f;
             for (int ch = 0; ch < g_woCh; ch++) d[ch] = (ch == 0) ? l : (ch == 1 ? r : 0.0f);
         }
         if (got < c) shortage += c - got;
@@ -1262,9 +1546,12 @@ static DWORD WINAPI WoThread(LPVOID)
     {
         Log("[wo] !! Start failed");
         InterlockedExchange(&g_woState, 4);
+        InterlockedExchange(&g_woAlive, 0);   /* this path used to leave it set, so
+                                                 rollback waited 2 s for a dead thread */
         return 0;
     }
     InterlockedExchange(&g_woState, 3);
+    InterlockedExchange(&g_woReading, 1);
     Log("[wo] output running");
     while (g_woRun)
     {
@@ -1292,6 +1579,7 @@ static DWORD WINAPI WoThread(LPVOID)
         }
         FakePoke();
     }
+    InterlockedExchange(&g_woReading, 0);
     g_woClient->Stop();
     InterlockedExchange(&g_woAlive, 0);
     Log("[wo] thread exit");
@@ -1299,29 +1587,33 @@ static DWORD WINAPI WoThread(LPVOID)
 }
 
 /* Synchronous init: must claim the device before CRI creates stream2. */
+static const GUID kSubFloat =
+{ 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
 static BOOL WoInit(int exclusive)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* ignore RPC_E_CHANGED_MODE */
 
     IMMDeviceEnumerator* en = NULL;
+    IMMDevice* dev = NULL;
+    WAVEFORMATEX* wf = NULL;
+    BOOL ok = FALSE;
+    UINT32 rate = 44100;
+
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                   __uuidof(IMMDeviceEnumerator), (void**)&en);
     if (FAILED(hr) || !en) { Log("[wo] !! enumerator hr=0x%08X", (unsigned)hr); return FALSE; }
-    IMMDevice* dev = NULL;
     hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
-    en->Release();
-    if (FAILED(hr) || !dev) { Log("[wo] !! endpoint hr=0x%08X", (unsigned)hr); return FALSE; }
+    if (FAILED(hr) || !dev) { Log("[wo] !! endpoint hr=0x%08X", (unsigned)hr); goto done; }
     hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&g_woClient);
-    dev->Release();
-    if (FAILED(hr) || !g_woClient) { Log("[wo] !! activate hr=0x%08X", (unsigned)hr); return FALSE; }
+    if (FAILED(hr) || !g_woClient) { Log("[wo] !! activate hr=0x%08X", (unsigned)hr); goto done; }
 
-    WAVEFORMATEX* wf = NULL;   /* must keep the full WAVEFORMATEXTENSIBLE for shared mode */
     g_woFloat = 0;
 
     if (exclusive)
     {
         wf = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
-        if (!wf) return FALSE;
+        if (!wf) goto done;
         memset(wf, 0, sizeof(WAVEFORMATEX));
         wf->wFormatTag      = WAVE_FORMAT_PCM;
         wf->nChannels       = 2;
@@ -1330,14 +1622,24 @@ static BOOL WoInit(int exclusive)
         wf->nBlockAlign     = 4;
         wf->nAvgBytesPerSec = 44100 * 4;
         wf->cbSize          = 0;
+        rate = 44100;
         WAVEFORMATEX* closest = NULL;
         HRESULT chk = g_woClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf, &closest);
-        if (chk != S_OK) { Log("[wo] !! exclusive 16-bit rejected hr=0x%08X", (unsigned)chk); return FALSE; }
+        if (closest) CoTaskMemFree(closest);
+        if (chk != S_OK) { Log("[wo] !! exclusive 16-bit rejected hr=0x%08X", (unsigned)chk); goto done; }
     }
     else
     {
-        if (FAILED(g_woClient->GetMixFormat(&wf)) || !wf) { Log("[wo] !! GetMixFormat failed"); return FALSE; }
-        g_woFloat = (wf->wBitsPerSample == 32) ? 1 : 0;
+        if (FAILED(g_woClient->GetMixFormat(&wf)) || !wf) { Log("[wo] !! GetMixFormat failed"); goto done; }
+        rate = wf->nSamplesPerSec;
+        /* Only treat the stream as float when the sub-format really says so:
+           32-bit INTEGER PCM used to be reinterpreted as float -> full-scale noise. */
+        if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wf->cbSize >= 22)
+            g_woFloat = IsEqualGUID(((const WAVEFORMATEXTENSIBLE*)wf)->SubFormat, kSubFloat) ? 1 : 0;
+        else
+            g_woFloat = (wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ? 1 : 0;
+        if (rate != 44100)
+            Log("[wo] endpoint is %u Hz -> resampling 44100 -> %u (linear interpolation)", rate, rate);
     }
 
     REFERENCE_TIME dur = exclusive ? 50000 : 0;
@@ -1349,65 +1651,137 @@ static BOOL WoInit(int exclusive)
         Log("[wo] !! Initialize hr=0x%08X %s (tag=0x%X %u Hz %u bit %u ch cbSize=%u)",
             (unsigned)hr, HrBrief(hr), wf->wFormatTag, wf->nSamplesPerSec,
             wf->wBitsPerSample, wf->nChannels, wf->cbSize);
-        CoTaskMemFree(wf);
-        return FALSE;
+        goto done;
     }
-    if (FAILED(g_woClient->GetBufferSize(&g_woFrames))) { Log("[wo] !! GetBufferSize failed"); return FALSE; }
+    if (FAILED(g_woClient->GetBufferSize(&g_woFrames)))
+    { Log("[wo] !! GetBufferSize failed"); goto done; }
 
     g_woEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (!g_woEvent || FAILED(g_woClient->SetEventHandle(g_woEvent)))
-    { Log("[wo] !! event setup failed"); return FALSE; }
+    { Log("[wo] !! event setup failed"); goto done; }
     if (FAILED(g_woClient->GetService(__uuidof(IAudioRenderClient), (void**)&g_woRender)) || !g_woRender)
-    { Log("[wo] !! GetService render failed"); return FALSE; }
+    { Log("[wo] !! GetService render failed"); goto done; }
 
     g_woCh = wf->nChannels;
-    Log("[wo] ready: %s %u Hz / %u bit / %u ch tag=0x%X, buffer=%u fr (%.2f ms)",
+    RsReset();
+    g_rsStep = 44100.0 / (double)rate;     /* 1.0 on a 44.1 kHz endpoint */
+    Log("[wo] ready: %s %u Hz / %u bit / %u ch tag=0x%X, buffer=%u fr (%.2f ms) resample=%s",
         exclusive ? "EXCLUSIVE" : "SHARED", wf->nSamplesPerSec, wf->wBitsPerSample, wf->nChannels,
-        wf->wFormatTag, g_woFrames, g_woFrames * 1000.0 / 44100.0);
-    CoTaskMemFree(wf);
-    return TRUE;
+        wf->wFormatTag, g_woFrames, g_woFrames * 1000.0 / (double)rate,
+        (g_rsStep == 1.0) ? "no" : "yes");
+    ok = TRUE;
+
+done:
+    if (!ok)
+    {
+        /* Every failure path releases here. A half-initialised exclusive client
+           used to keep the device claimed, so the shared fallback (and every
+           other app) saw DEVICE_IN_USE. */
+        if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
+        if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
+        if (g_woEvent)  { CloseHandle(g_woEvent); g_woEvent = NULL; }
+    }
+    if (wf) CoTaskMemFree(wf);
+    if (dev) dev->Release();
+    if (en) en->Release();
+    return ok;
+}
+
+/* Stop the writer thread and free the stream - but only once the thread has
+   really left its loop. Freeing under it was the v13.0 use-after-free. */
+static void WoShutdown(void)
+{
+    InterlockedExchange(&g_woRun, 0);
+    for (int i = 0; i < 400 && g_woAlive; i++) Sleep(5);   /* blocks <= 200 ms */
+    if (g_woAlive)
+    {
+        Log("[wo] !! thread did not stop within 2 s - leaking the stream objects instead of freeing them");
+        InterlockedExchange(&g_woState, 4);
+        return;
+    }
+    if (g_woClient) g_woClient->Stop();
+    if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
+    if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
+    if (g_woEvent)  { CloseHandle(g_woEvent); g_woEvent = NULL; }
+    InterlockedExchange(&g_woState, 0);
 }
 
 /* Init + start. exclusive==1 -> exclusive, else shared.
    Exclusive gets a 600 ms self-test: some drivers (Focusrite USB here) hand out
    a 5 ms buffer but only consume ~88% of real time, which starves the queue and
-   makes the game's music stutter/repeat. If the measured rate is short we stop
-   and let the caller fall back, so a bad driver can never break audio. */
+   makes the game's music stutter/repeat. The self-test now cross-checks the
+   device clock (IAudioClock) as well, because "frames written" alone can look
+   healthy while the hardware is not moving. */
 static BOOL WoStart(int exclusive)
 {
-    if (InterlockedCompareExchange(&g_woState, 2, 0) != 0) return g_woState == 3;
-    if (!WoInit(exclusive)) { InterlockedExchange(&g_woState, 0); return FALSE; }
+    BOOL claimed = FALSE;
+    for (int spin = 0; spin < 400; spin++)
+    {
+        LONG st = g_woState;
+        if (st == 3) return TRUE;
+        if (st == 0 || st == 4)     /* 4 = previous failure; allow a retry */
+        {
+            if (InterlockedCompareExchange(&g_woState, 2, st) == st) { claimed = TRUE; break; }
+        }
+        Sleep(5);
+    }
+    if (!claimed) { Log("[wo] !! could not claim the output backend"); return FALSE; }
+
+    if (!WoInit(exclusive))
+    {
+        Log("[wo] !! init failed (%s)", exclusive ? "exclusive" : "shared");
+        InterlockedExchange(&g_woState, 4);
+        return FALSE;
+    }
 
     InterlockedExchange64(&g_woOut, 0);
     InterlockedExchange(&g_woRun, 1);
     HANDLE t = CreateThread(NULL, 0, WoThread, NULL, 0, NULL);
-    if (!t) { InterlockedExchange(&g_woState, 4); return FALSE; }
+    if (!t) { Log("[wo] !! CreateThread failed"); WoShutdown(); return FALSE; }
     CloseHandle(t);
+
+    /* Wait for WoThread to report success (3) or failure (4): reporting success
+       straight after CreateThread hid Start() failures and blocked the fallback. */
+    for (int i = 0; i < 200 && g_woState == 2; i++) Sleep(5);
+    if (g_woState != 3)
+    {
+        Log("[wo] !! output did not start (%s)", exclusive ? "exclusive" : "shared");
+        WoShutdown();
+        return FALSE;
+    }
 
     if (exclusive)
     {
+        UINT64 c0 = 0, c1 = 0;
+        BOOL haveClk = FALSE;
+        IAudioClock* ck = NULL;
+        if (SUCCEEDED(g_woClient->GetService(__uuidof(IAudioClock), (void**)&ck)) && ck)
+            haveClk = SUCCEEDED(ck->GetPosition(&c0, NULL));
+
         Sleep(600);
+
         LONG64 out = g_woOut;
-        double rate = (double)out / 0.6;
+        double outRate = (double)out / 0.6;
+        double clkRate = 0.0;
+        if (haveClk && SUCCEEDED(ck->GetPosition(&c1, NULL)))
+            clkRate = (double)(c1 - c0) / 0.6;
+        if (ck) ck->Release();
+
+        double rate = outRate;
+        if (haveClk && clkRate > 0.0 && clkRate < rate) rate = clkRate;  /* the honest one */
+        Log("[wo] exclusive self-test: written=%.0f fr/s clock=%.0f fr/s -> %.1f%% of 44100",
+            outRate, clkRate, 100.0 * rate / 44100.0);
+
         if (rate < 44100.0 * 0.95)
         {
-            Log("[wo] !! exclusive self-test FAILED: %.0f fr/s (%.1f%% of 44100) - rolling back",
-                rate, 100.0 * rate / 44100.0);
-            InterlockedExchange(&g_woRun, 0);
-            /* wait for WoThread to leave its loop before tearing the objects down
-               (it blocks on the event for up to 200 ms) */
-            for (int i = 0; i < 400 && g_woAlive; i++) Sleep(5);
-            if (g_woAlive) Log("[wo] !! thread did not stop in 2 s - leaking objects instead of crashing");
-            if (!g_woAlive && g_woClient) g_woClient->Stop();
-            if (g_woRender) { g_woRender->Release(); g_woRender = NULL; }
-            if (g_woClient) { g_woClient->Release(); g_woClient = NULL; }
-            if (g_woEvent) { CloseHandle(g_woEvent); g_woEvent = NULL; }
-            InterlockedExchange(&g_woState, 0);
+            Log("[wo] !! exclusive self-test FAILED (%.1f%%) - rolling back",
+                100.0 * rate / 44100.0);
+            WoShutdown();
             InterlockedExchange(&g_woCbs, 0);
             InterlockedExchange(&g_woUnder, 0);
             return FALSE;
         }
-        Log("[wo] exclusive self-test OK: %.0f fr/s (%.1f%%)", rate, 100.0 * rate / 44100.0);
+        Log("[wo] exclusive self-test OK (%.1f%%)", 100.0 * rate / 44100.0);
     }
     return TRUE;
 }
@@ -1418,7 +1792,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
     DWORD flags, REFERENCE_TIME hnsBufferDuration, REFERENCE_TIME hnsPeriodicity,
     const WAVEFORMATEX* pFormat, LPCGUID audioSessionGuid)
 {
-    int fixed1 = 0, fixed2 = 0, excl2 = 0, fake = 0;
+    int fixed1 = 0, fixed2 = 0, fake = 0;
 
     if (g_orig == NULL) return E_FAIL;
     InterlockedIncrement(&g_initCalls);
@@ -1437,17 +1811,6 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
             {
                 fake = 1;                 /* v13: CRI gets our client, no real stream */
             }
-            else if (g_exclusive2)
-            {
-                /* experimental: EXCLUSIVE + polling (EVENTCALLBACK removed).
-                   duration 10 ms, periodicity 5 ms (Focusrite minimum). */
-                shareMode = AUDCLNT_SHAREMODE_EXCLUSIVE;
-                flags = 0;
-                hnsBufferDuration = 50000;    /* 5.000 ms (v4-proven buffer size) */
-                hnsPeriodicity = 50000;       /* 5.000 ms */
-                excl2 = 1;
-                Log("[ec] exclusive2 -> EXCLUSIVE + polling, dur=per=5ms");
-            }
             else
             {
                 flags = 0x00040000u;
@@ -1460,27 +1823,23 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
         }
     }
 
-    HRESULT hr = fake ? FakeInit(self, pFormat)
-                      : g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
-
-    /* exclusive2: record buffer/period, start the pseudo-EC driver once */
-    if (excl2 && SUCCEEDED(hr) && self != NULL)
+    HRESULT hr;
+    if (fake)
     {
-        UINT32 bf = 0;
-        if (SUCCEEDED(self->GetBufferSize(&bf)))
+        hr = FakeInit(self, pFormat);
+        if (FAILED(hr))
         {
-            InterlockedExchange(&g_s1BufFrames, (LONG)bf);
-            InterlockedExchange(&g_s1PeriodFrames, (LONG)(44100 * 5 / 1000));
-            Log("[ec] exclusive2 granted buffer = %u frames (%.2f ms), period=%ld frames",
-                bf, bf * 1000.0 / 44100.0, (long)g_s1PeriodFrames);
-        }
-        if (InterlockedCompareExchange(&g_pseudoEC, 1, 0) == 0)
-        {
-            HANDLE t = CreateThread(NULL, 0, PseudoECThread, NULL, 0, NULL);
-            if (t) CloseHandle(t);
-            else { InterlockedExchange(&g_pseudoEC, 0); Log("[ec] !! driver thread failed"); }
+            /* The takeover is an enhancement, never a requirement: if it cannot
+               be installed, give the client back to the real WASAPI path instead
+               of returning a failure that leaves the game silent. */
+            Log("[fake] !! takeover failed (hr=0x%08X) -> using the real WASAPI client", (unsigned)hr);
+            InterlockedExchange(&g_fake.on, 0);
+            fake = 0;
+            hr = g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
         }
     }
+    else
+        hr = g_orig(self, shareMode, flags, hnsBufferDuration, hnsPeriodicity, pFormat, audioSessionGuid);
 
     UINT32 bufFrames = 0;
     REFERENCE_TIME sLat = 0;
@@ -1493,13 +1852,10 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
     if (fake)
         Log("stream1 v13: FAKE client (no engine buffer, no device hold)  hr=0x%08X %s  buffer=%u fr",
             (unsigned)hr, HrBrief(hr), bufFrames);
-    else if (excl2)
-        Log("stream1 exclusive2: EXCLUSIVE+polling  hr=0x%08X %s  buffer=%u fr (%.2f ms)  latency=%.2f ms",
-            (unsigned)hr, HrBrief(hr), bufFrames, bufFrames * 1000.0 / 44100.0, sLat / 10000.0);
     else if (fixed1)
         Log("stream1 FIX: flags 0x00140000 -> 0x00040000 (RATEADJUST removed)  hr=0x%08X %s",
             (unsigned)hr, HrBrief(hr));
-    if (fixed1 && !excl2) Log("stream1 -> engine granted buffer = %u frames (%.2f ms)  streamLatency=%.2f ms",
+    if (fixed1) Log("stream1 -> engine granted buffer = %u frames (%.2f ms)  streamLatency=%.2f ms",
                     bufFrames, bufFrames * 1000.0 / 44100.0, sLat / 10000.0);
     if (fixed2) Log("stream2 FIX: duration -> 166666 (was >=600000)  hr=0x%08X %s",
                     (unsigned)hr, HrBrief(hr));
@@ -1540,7 +1896,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
                 }
             }
         }
-        else if (g_asioEn && !excl2)
+        else if (g_asioEn)
         {
             if (InterlockedCompareExchange(&g_asioStartReq, 1, 0) == 0)
             {
@@ -1561,64 +1917,93 @@ static void ReadConfig(void)
     char path[MAX_PATH];
     MakePath(path, sizeof(path), "audio_hook.txt");
     FILE* f = NULL;
-    if (fopen_s(&f, path, "rb") != 0 || !f) { Log("no audio_hook.txt -> asio=0"); return; }
-    char buf[4096];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = '\0';
-    fclose(f);
-    const char* p = buf;
-    while (p && *p)
+    if (fopen_s(&f, path, "rb") != 0 || !f)
+        Log("no audio_hook.txt -> using defaults (fake_client=1, output=asio)");
+    else
     {
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (*p == '\0') break;
-        if (*p == '#') { const char* nl = strchr(p, '\n'); p = nl ? nl + 1 : NULL; continue; }
-        const char* eq = strchr(p, '=');
-        if (!eq) break;
-        char key[64] = { 0 };
-        int k = 0;
-        for (const char* q = p; q < eq && k < 63; q++)
-            if (*q != ' ' && *q != '\t') key[k++] = *q;
-        const char* v = eq + 1;
-        while (*v == ' ' || *v == '\t') v++;
-        if (_stricmp(key, "asio_driver") == 0)
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+
+        /* parse LINE BY LINE: strchr(p,'=') used to jump across a line that had
+           no '=', swallowing every key between it and the next real '=' */
+        char* p = buf;
+        while (p && *p)
         {
-            int j = 0;
-            while (v[j] && v[j] != '\r' && v[j] != '\n' && j < 95) { g_asioMatch[j] = v[j]; j++; }
-            while (j > 0 && (g_asioMatch[j - 1] == ' ' || g_asioMatch[j - 1] == '\t')) j--;
-            g_asioMatch[j] = '\0';
+            char* nl = strchr(p, '\n');
+            if (nl) *nl = '\0';
+            char* line = p;
+            p = nl ? nl + 1 : NULL;
+
+            while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+            if (!*line || *line == '#' || *line == ';') continue;
+
+            char* eq = strchr(line, '=');
+            if (!eq) { Log("config: ignoring malformed line '%s'", line); continue; }
+            *eq = '\0';
+
+            char key[64] = { 0 };
+            int k = 0;
+            for (char* q = line; *q && k < 63; q++)
+                if (*q != ' ' && *q != '\t' && *q != '\r') key[k++] = *q;
+
+            char* v = eq + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            char* ve = v + strlen(v);
+            while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t' || ve[-1] == '\r')) *--ve = '\0';
+
+            if (_stricmp(key, "asio_driver") == 0)
+            {
+                strncpy_s(g_asioMatch, sizeof(g_asioMatch), v, _TRUNCATE);
+            }
+            else if (_stricmp(key, "output") == 0)
+            {
+                if (_strnicmp(v, "excl", 4) == 0)        g_outMode = 1;
+                else if (_strnicmp(v, "shared", 6) == 0) g_outMode = 2;
+                else                                     g_outMode = 0;   /* asio */
+            }
+            else if (_stricmp(key, "exclusive2") == 0)
+            {
+                if (atoi(v) != 0)
+                    Log("config: exclusive2 was removed in v13 (no device could run it) - ignored");
+            }
+            else
+            {
+                int val = atoi(v);
+                if (_stricmp(key, "asio") == 0) g_asioEn = val;
+                else if (_stricmp(key, "block") == 0) g_asioBlock = val;
+                else if (_stricmp(key, "mute_mode") == 0) g_muteMode = val;
+                else if (_stricmp(key, "handoff_ms") == 0) g_handoffMs = val;
+                else if (_stricmp(key, "fake_client") == 0) g_fakeClient = val;
+                else Log("config: unknown key '%s' ignored", key);
+            }
         }
-        else if (_stricmp(key, "output") == 0)
-        {
-            if (_strnicmp(v, "excl", 4) == 0)        g_outMode = 1;
-            else if (_strnicmp(v, "shared", 6) == 0) g_outMode = 2;
-            else                                     g_outMode = 0;   /* asio */
-        }
-        else
-        {
-            int val = atoi(v);
-            if (_stricmp(key, "asio") == 0) g_asioEn = val;
-            else if (_stricmp(key, "block") == 0) g_asioBlock = val;
-            else if (_stricmp(key, "mute_mode") == 0) g_muteMode = val;
-            else if (_stricmp(key, "handoff_ms") == 0) g_handoffMs = val;
-            else if (_stricmp(key, "exclusive2") == 0) g_exclusive2 = val;
-            else if (_stricmp(key, "fake_client") == 0) g_fakeClient = val;
-        }
-        const char* nl = strchr(eq, '\n');
-        p = nl ? nl + 1 : NULL;
     }
+
     if (g_asioBlock < 16) g_asioBlock = 16;
     if (g_asioBlock > 1024) g_asioBlock = 1024;
     if (g_handoffMs < 0) g_handoffMs = 0;
     if (g_handoffMs > 150) g_handoffMs = 150;
+    g_asioEn = g_asioEn ? 1 : 0;
+    g_fakeClient = g_fakeClient ? 1 : 0;
+
     if (g_outMode != 0 && !g_fakeClient)
     {
         Log("!! output=%s requires fake_client=1 -> falling back to ASIO path",
             g_outMode == 1 ? "excl" : "shared");
         g_outMode = 0;
     }
-    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s' | exclusive2=%d fake_client=%d | output=%s",
-        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch, g_exclusive2, g_fakeClient,
+    if (g_fakeClient && !g_asioEn && g_outMode == 0)
+    {
+        /* takeover with every backend disabled = guaranteed silence */
+        Log("!! fake_client=1 with asio=0 and output=asio -> forcing output=shared");
+        g_outMode = 2;
+    }
+    Log("config: asio=%d block=%d | mute_mode=%d handoff_ms=%d | driver='%s' | fake_client=%d | output=%s",
+        g_asioEn, g_asioBlock, g_muteMode, g_handoffMs, g_asioMatch, g_fakeClient,
         g_outMode == 0 ? "asio" : (g_outMode == 1 ? "excl" : "shared"));
+    Log("MODE: %s", g_fakeClient ? "v13 takeover (no engine buffer)" : "v9 buffer trim only");
 }
 
 /* --------------------- boot device watchdog --------------------- */
@@ -1666,21 +2051,32 @@ static DWORD WINAPI WatchdogThread(LPVOID)
 {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    for (int i = 1; i <= 3600; i++)
+    /* no hard iteration cap: this used to stop after an hour, after which any
+       later anomaly went unrecorded */
+    for (long long i = 1; ; i++)
     {
         Sleep(1000);
 
-        if (i <= 20)
+        if (i <= 3)                 /* boot window only; it used to log for 20 s */
             DeviceProbeOnce("probe");
 
+        /* Deferred stale-mute cleanup. With the fake client there is no real
+           stream1 session, so the cleanup at Initialize() time finds nothing;
+           by now stream2 (or the output backend) has created this process's
+           session, which is the one Windows remembers as muted. */
+        if (i == 5 && g_fakeClient && g_sessionActive)
+        {
+            if (MuteSession(FALSE))
+                Log("[fix] cleared stale session-mute residue (deferred)");
+        }
+
         if (i <= 30 || (i % 60) == 0)
-            Log("[hb] up=%ds init=%ld rc=%ld | asio en=%d st=%ld cbs=%ld taps=%lld und=%ld drops=%lld zeroTap=%ld zeroed=%lld kicked=%ld",
+            Log("[hb] up=%llds init=%ld rc=%ld | asio en=%d st=%ld cbs=%ld taps=%lld und=%ld drops=%lld zeroTap=%ld zeroed=%lld kicked=%ld",
                 i, g_initCalls, g_rcCalls,
                 g_asioEn, g_asioState, g_asoCbs,
                 (long long)g_tapFrames, g_underruns, (long long)g_ringDrops,
                 g_zeroTap, (long long)g_zeroed, g_kicked);
     }
-    return 0;
 }
 
 /* ------------------- process-detach trap (diagnostic) ------------------- */
@@ -1762,14 +2158,30 @@ extern "C" __declspec(dllexport) void PreInit(void)
 
     QueryPerformanceFrequency(&g_qpcFreq);
     QueryPerformanceCounter(&g_qpc0);
+    if (g_qpcFreq.QuadPart <= 0) g_qpcFreq.QuadPart = 1;   /* MsNow() must never divide by 0 */
 
-    fopen_s(&g_log, lp, "wb");
+    /* keep exactly one previous log: the run that crashed is the one worth
+       reading, and "wb" used to wipe it on every start */
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(lp, GetFileExInfoStandard, &fa) &&
+            fa.nFileSizeHigh == 0 && fa.nFileSizeLow > (4u << 20))
+        {
+            char old[MAX_PATH];
+            MakePath(old, sizeof(old), "audio_hook.log.1");
+            DeleteFileA(old);
+            MoveFileA(lp, old);
+        }
+    }
+    fopen_s(&g_log, lp, "ab");
     if (!g_log) return;
 
+    timeBeginPeriod(1);   /* 1 ms timer resolution: Sleep(1) no longer rounds up to 15.6 ms */
+
     Log("============================================================");
-    Log(" audio_hook v13.0 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.1 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
-    Log(" hooks: [3]Initialize [14]GetService (+RC lazy)");
+    Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");
 
     if (GetFileAttributesA(off) != INVALID_FILE_ATTRIBUTES)
@@ -1781,12 +2193,29 @@ extern "C" __declspec(dllexport) void PreInit(void)
     g_sessionActive = 1;
     ReadConfig();
 
-    /* ring memory (never allocated again; callback path stays allocation-free) */
-    if (g_asioEn)
+    /* ring memory (never allocated again; callback path stays allocation-free).
+       It must exist whenever a consumer or the fake client is active, NOT only
+       when ASIO is enabled: fake_client=1 + asio=0 used to write through a NULL
+       ring pointer and crash on the first ReleaseBuffer. */
+    g_ring = (short*)malloc((size_t)RING_CAP * 2 * sizeof(short));
+    if (!g_ring)
     {
-        g_ring = (short*)malloc((size_t)RING_CAP * 2 * sizeof(short));
-        if (!g_ring) { Log("[asio] !! ring alloc failed - ASIO disabled"); g_asioEn = 0; }
+        Log("!! ring alloc failed -> takeover and ASIO disabled (v9 path only)");
+        g_fakeClient = 0;
+        g_asioEn = 0;
+        g_outMode = 0;
     }
+
+    /* prefill the format the fake client reports: GetMixFormat can be called
+       before Initialize, and a zeroed WAVEFORMATEX (nSamplesPerSec = 0) makes
+       a caller divide by zero */
+    memset(&g_fake.fmt, 0, sizeof(g_fake.fmt));
+    g_fake.fmt.wFormatTag      = WAVE_FORMAT_PCM;
+    g_fake.fmt.nChannels       = 2;
+    g_fake.fmt.nSamplesPerSec  = 44100;
+    g_fake.fmt.wBitsPerSample  = 16;
+    g_fake.fmt.nBlockAlign     = 4;
+    g_fake.fmt.nAvgBytesPerSec = 44100 * 4;
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -1805,13 +2234,19 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (FAILED(hr) || !c) { Log("!! activate failed 0x%08X - NOT hooked", (unsigned)hr); dev->Release(); en->Release(); return; }
 
     void** vt = *(void***)c;
-    Log("vtable=%p  [3]=%p  [14]=%p", vt, vt[3], vt[14]);
+    Log("vtable=0x%llX  [3]=0x%llX  [14]=0x%llX",
+        (unsigned long long)(UINT_PTR)vt,
+        (unsigned long long)(UINT_PTR)vt[3],
+        (unsigned long long)(UINT_PTR)vt[14]);
 
     BOOL ok3  = PatchSlot(vt,  3, (void*)&Hook_Initialize, (void**)&g_orig);
     BOOL ok14 = PatchSlot(vt, 14, (void*)&Hook_GetService, (void**)&oGS);
-    BOOL ok13 = (g_exclusive2 || g_fakeClient) ? PatchSlot(vt, 13, (void*)&Hook_SetEventHandle, (void**)&oSEH) : FALSE;
-    Log("hooked: [3]=%s (orig=%p)  [14]=%s  [13]=%s (exclusive2=%d fake=%d)",
-        ok3 ? "OK" : "FAIL", g_orig, ok14 ? "OK" : "FAIL", ok13 ? "OK" : "skip", g_exclusive2, g_fakeClient);
+    BOOL ok13 = g_fakeClient ? PatchSlot(vt, 13, (void*)&Hook_SetEventHandle, (void**)&oSEH) : FALSE;
+    Log("hooked: [3]=%s (orig=0x%llX)  [14]=%s  [13]=%s (fake_client=%d)",
+        ok3 ? "OK" : "FAIL", (unsigned long long)(UINT_PTR)g_orig,
+        ok14 ? "OK" : "FAIL", ok13 ? "OK" : "skip", g_fakeClient);
+    if (!ok3 || !ok14)
+        Log("!! core hooks failed - the mod cannot do anything on this process");
 
     /* diagnostic: listen to device notifications */
     g_notifier = new NotifyLogger();

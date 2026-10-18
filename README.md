@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.0-informational)
+![Version](https://img.shields.io/badge/version-v13.1-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Replaces the game's audio **client** (not its code) so the engine buffer disappears from the path, then renders the game's PCM through a backend of your choice: **ASIO**, **WASAPI exclusive** or **WASAPI shared**.
@@ -73,16 +73,22 @@ Only vtable slots are patched (data layer):
 - `IAudioClient` — `[3]` `Initialize`, `[4]`–`[12]` (`GetBufferSize` … `Reset`), `[13]` `SetEventHandle`, `[14]` `GetService`
 - `IAudioRenderClient` — `[3]` `GetBuffer`, `[4]` `ReleaseBuffer`
 
-No code bytes are written and no return values are forged.
+No code bytes are written. The game's own **COM implementation** is replaced (our client answers `GetBufferSize` / `GetBuffer` / …), which is exactly what keeps the engine buffer out of the path — but no executable memory is modified.
 
 ### 4. Robustness
 
-- **Self-test + staged fallback** for `excl`: exclusive → shared → ASIO, each logged.
+- **All-or-nothing vtable patches.** Both the client takeover (9 slots) and the render-client tap (2 slots) are installed as a set; if any slot cannot be patched, the ones already written are rolled back. A half-patched table used to leave `slot 3 = our hook` while the "patched" flag stayed 0, so the next attempt hooked our own function onto itself (stack overflow).
+- **Staged fallback with real verification:** `output = excl` → `shared` → ASIO. Each stage now *waits* for its thread to report success, so a failed `Start()` no longer looks like a working backend.
+- **Exclusive self-test** (600 ms) checks both delivered frames and the **device clock** (`IAudioClock`); below 95 % of real time it tears the stream down and falls back.
+- **Fake mode has a real fallback:** if ASIO dies while the client is faked, the mod starts the shared backend (`WoStart(0)`) instead of the old "game audio returns via WASAPI", which was impossible with no real stream.
+- **No engine handoff in fake mode:** the tap-and-zero dance (resync + 23 ms wait) is skipped, so starting a song no longer discards ~10 ms of already mixed audio.
+- **Ring memory is allocated unconditionally** and every ring access is NULL-guarded, so `fake_client = 1` + `asio = 0` (previously a guaranteed crash) now works and is auto-corrected to `output = shared`.
 - **Arbitrary channel counts** on the output side (2.0 / 5.1 / 7.1 devices), FL/FR mapped, extra channels silenced.
 - **Partial writes**: only as many frames as the ring actually holds are released, so a device whose engine buffer is larger than CRI's queue does not get zero-padded every period.
-- **Bounded waits**: the tap-steady wait times out after 30 s instead of spinning forever.
+- **Bounded waits**: the tap-steady wait times out after 30 s; the exclusive rollback waits for its writer thread to actually exit (2 s) and leaks rather than frees if it doesn't (no use-after-free).
 - **Realtime-safe callbacks**: no file I/O and no allocation inside the ASIO/WASAPI callbacks; counters are reported by a monitor thread.
-- **Stale-mute cleanup**: clears the Windows per-app session-mute residue left by older builds on boot.
+- **Session mute cleanup** now walks the process's own audio sessions (`IAudioSessionManager2`), so it also works when stream1 is faked — it used to fail with `AUDCLNT_E_NOT_INITIALIZED` and silently do nothing.
+- **Logs**: one atomic write per line, append mode with rotation (`audio_hook.log.1`), so the run that crashed is still readable.
 
 ---
 
@@ -130,7 +136,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.0`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.1` and `MODE: v13 takeover`.
 
 ---
 
@@ -146,7 +152,6 @@ asio_driver = *          # or an exact name: Focusrite USB ASIO
 block       = 64
 handoff_ms  = 0
 mute_mode   = 1
-exclusive2  = 0          # legacy experiment, always 0
 ```
 
 | Key | Default | Meaning |
@@ -169,7 +174,9 @@ Loads the ASIO driver on an **STA** worker thread, taps CRI's PCM directly from 
 
 ### `shared` (no ASIO driver required)
 
-Opens a normal WASAPI shared stream on the default endpoint (mix format, float32 supported) and writes the frames the ring currently holds. This keeps the engine's ~22 ms buffer in the path — that buffer is a platform floor, not something a client can shrink — but it removes CRI's own buffer and works everywhere.
+Opens a normal WASAPI shared stream on the default endpoint (mix format, float32 or 16-bit) and writes the frames the ring currently holds. This keeps the engine's ~22 ms buffer in the path — that buffer is a platform floor, not something a client can shrink — but it removes CRI's own buffer and works everywhere.
+
+If the endpoint is **not 44.1 kHz** (48 kHz HDMI / Bluetooth / onboard is common), the backend resamples 44.1 kHz → device rate with linear interpolation (≈1 frame of latency, inaudible at these ratios) instead of playing the whole game 8.8 % fast. The log line says `resample=yes`.
 
 ### `excl`
 
@@ -367,9 +374,11 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 ## Known limitations
 
 - **WASAPI exclusive is driver-dependent.** Measured on the test machine: Focusrite USB **88.5 %**, Realtek onboard **0.3 %** of real time. The backend therefore self-tests and falls back; it is not the default and not a recommended path.
+- **The exclusive self-test runs on the game's init thread**, so `output = excl` adds ~600 ms to the first audio initialisation (and claims the device before stream2 exists). Acceptable for an experiment; not used by default.
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.
+- `exclusive2` from older configs is **ignored** (it was removed in v13 and cannot work on any tested device); the mod logs a line when it sees the key.
 
 ---
 
