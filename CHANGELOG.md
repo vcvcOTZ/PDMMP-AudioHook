@@ -3,8 +3,43 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.4`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.5`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.5] — 2026-10-18
+
+Robustness hardening pass: seven items from a follow-up review, all field-tested.
+
+### Fixed / hardened
+
+- **Allocation-failure checks.** `FakeRC` / `FakeClock` / the notification logger now use
+  `new (std::nothrow)` and are NULL-checked instead of relying on an exception that would
+  `terminate()` the process.
+- **Back-pressure degrades when the timer is not raised.** `FakeRC::GetBuffer`'s 5×`Sleep(1)`
+  becomes a single attempt when `timeBeginPeriod(1)` failed, so the mixing thread is never
+  blocked for ~78 ms.
+- **`WoThread` initialises COM.** The shared writer now calls
+  `CoInitializeEx(NULL, COINIT_MULTITHREADED)` before its cross-apartment `IAudioClient`
+  calls.
+- **`GetService(IUnknown)` identity.** The fake client's `GetService` now returns the real
+  client's `IUnknown` (matching a `QueryInterface`), not the render client's.
+- **Boot mute cleanup is skipped in fake mode.** `Hook_Initialize` no longer walks the
+  session list when there is no real stream1 session (the watchdog's 5 s deferred cleanup
+  handles it).
+
+### Docs
+
+- The header comment now lists the fake client's `[4]..[12]` slots; "How it works" no longer
+  claims "no resampling" (the `shared` backend resamples non-44.1 kHz endpoints).
+- README now calls out the ASIO probe's `init()` side effects (pin `asio_driver` on a
+  multi-driver machine), the one-way `excl` → `shared` fall-back, and the refusal of
+  24-bit/32-bit integer shared mix formats.
+
+### Build
+
+`/W3` and `/W4`: zero warnings.
 
 ---
 

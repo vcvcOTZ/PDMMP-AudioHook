@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.4 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.5 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -19,7 +19,8 @@
  *
  * Patched vtable slots (data layer only, never a code byte):
  *   IAudioClient          [3] Initialize, [14] GetService,
- *                         [13] SetEventHandle (only when fake_client = 1)
+ *                         [13] SetEventHandle (only when fake_client = 1),
+ *                         [4]..[12] GetBufferSize..Reset (only when fake_client = 1)
  *   IAudioRenderClient    [3]/[4]  (lazy; legacy tap path only)
  *
  * Not patched: any code in DivaMegaMix.exe. Denuvo-safe by construction.
@@ -37,6 +38,7 @@
 #include <string.h>
 #include <math.h>
 #include <intrin.h>
+#include <new>         /* std::nothrow */
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
@@ -845,7 +847,11 @@ static BOOL WaitForTapSteady(void)
         LONG64 now = g_tapFrames;
         LONG64 d = now - prev;
         prev = now;
-        if (d >= 3900) { good++; if (good >= 3) return TRUE; }   /* >=88% real-time */
+        if (d >= 3900) { good++; if (good >= 3) return TRUE; }   /* ~88% real-time: the tap is
+                                                                     merely *producing* - looser
+                                                                     than the excl self-test's 95%
+                                                                     rollback bar (which judges the
+                                                                     device clock itself) */
         else good = 0;
         /* robustness: never spin forever. If the tap can't reach real-time in
            30 s (device contention, audio service fault, ...), give up and let
@@ -1093,12 +1099,12 @@ static HRESULT STDMETHODCALLTYPE Hook_RC_ReleaseBuffer(void* self, UINT32 frames
 /* v13 forward decls (definitions live in the fake-client section below) */
 static int    FakeIsSelf(IAudioClient* self);
 static HRESULT FakeSetEventHandle(IAudioClient* self, HANDLE hEvent);
-static HRESULT FakeGetService(REFIID riid, void** ppv);
+static HRESULT FakeGetService(IAudioClient* self, REFIID riid, void** ppv);
 static void   FakePoke(void);
 
 static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* self, REFIID riid, void** ppv)
 {
-    if (FakeIsSelf(self)) return FakeGetService(riid, ppv);
+    if (FakeIsSelf(self)) return FakeGetService(self, riid, ppv);
 
     HRESULT hr = oGS ? oGS(self, riid, ppv) : E_FAIL;
     BOOL isRC = (riid.Data1 == 0xF294ACFC && riid.Data2 == 0x3146 && riid.Data3 == 0x4483);
@@ -1220,7 +1226,12 @@ public:
            Sleep(1) here is only ~1 ms because PreInit() calls timeBeginPeriod(1)
            - if that is ever removed, each Sleep(1) becomes ~15.6 ms and this
            wait balloons to ~78 ms on the mixing thread (audit R12). */
-        for (int i = 0; i < 5 && RingAvail() + n > FAKE_FRAMES; i++) Sleep(1);
+        /* Sleep(1) is ~1 ms only while timeBeginPeriod(1) is in effect; without
+           it each Sleep(1) rounds up to ~15.6 ms and 5 tries = ~78 ms on CRI's
+           mixing thread. If the timer was not raised, do a single quick attempt
+           and give up instead (the "buffer too large" answer is safe here). */
+        int tries = g_timerPeriod ? 5 : 1;
+        for (int i = 0; i < tries && RingAvail() + n > FAKE_FRAMES; i++) Sleep(1);
         if (RingAvail() + n > FAKE_FRAMES)
         {
             InterlockedIncrement(&g_fakeGbFail);
@@ -1301,7 +1312,7 @@ static HRESULT FakeSetEventHandle(IAudioClient* self, HANDLE h)
     return S_OK;
 }
 
-static HRESULT FakeGetService(REFIID riid, void** ppv)
+static HRESULT FakeGetService(IAudioClient* self, REFIID riid, void** ppv)
 {
     if (!ppv) return E_POINTER;
     *ppv = NULL;
@@ -1321,8 +1332,12 @@ static HRESULT FakeGetService(REFIID riid, void** ppv)
     }
     if (IsEqualIID(riid, __uuidof(IUnknown)))
     {
-        *ppv = (void*)g_fakeRc;
-        g_fakeRc->AddRef();
+        /* GetService(IUnknown) is not a service query, and CRI never issues it
+           (the log shows only IAudioRenderClient). Return the client's own
+           IUnknown so the identity matches what QueryInterface would hand back,
+           not the render client's. */
+        *ppv = self;
+        self->AddRef();
         return S_OK;
     }
     Log("[fake] GetService unsupported riid=%08X-%04X-%04X", riid.Data1, riid.Data2, riid.Data3);
@@ -1482,8 +1497,9 @@ static HRESULT FakeInit(IAudioClient* self, const WAVEFORMATEX* fmt)
     }
     if (!g_fake.stage || !g_fake.zero) return E_OUTOFMEMORY;
 
-    if (!g_fakeRc)  g_fakeRc  = new FakeRC();
-    if (!g_fakeClk) g_fakeClk = new FakeClock();
+    if (!g_fakeRc)  g_fakeRc  = new (std::nothrow) FakeRC();
+    if (!g_fakeClk) g_fakeClk = new (std::nothrow) FakeClock();
+    if (!g_fakeRc || !g_fakeClk) return E_OUTOFMEMORY;   /* nothrow new, no exception */
 
     g_fake.self = self;
     memcpy(&g_fake.fmt, fmt, sizeof(WAVEFORMATEX));
@@ -1674,6 +1690,7 @@ static void WoFillFloat(BYTE* p, UINT32 n)
 
 static DWORD WINAPI WoThread(LPVOID)
 {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* IAudioClient calls are cross-apartment */
     InterlockedExchange(&g_woAlive, 1);
     Log("[wo] thread up (frames=%u float=%d)", (unsigned)g_woFrames, g_woFloat);
     if (FAILED(g_woClient->Start()))
@@ -2092,8 +2109,13 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* self, AUDCLNT_SHA
            SetMute(TRUE) on this session and runs that ended in a forced kill
            left the Windows audio engine remembering the game as MUTED forever
            (it persists per app path across restarts) -> "no sound after the
-           mod is disabled". Clear it every boot; harmless when already clean. */
-        if (MuteSession(FALSE))
+           mod is disabled". Clear it every boot; harmless when already clean.
+
+           With the fake client stream1 has no real session, so this walk finds
+           nothing - the deferred cleanup in the watchdog (at 5 s, once the
+           output backend / stream2 has created a session) does it instead.
+           Skip the pointless session enumeration here. */
+        if (!g_fakeClient && MuteSession(FALSE))
             Log("[fix] cleared stale session-mute residue (v10d era)");
 
         if (fake && g_outMode != 0)
@@ -2434,7 +2456,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v13.4 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.5 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");
@@ -2510,9 +2532,9 @@ extern "C" __declspec(dllexport) void PreInit(void)
         Log("!! core hooks failed - the mod cannot do anything on this process");
 
     /* diagnostic: listen to device notifications */
-    g_notifier = new NotifyLogger();
+    g_notifier = new (std::nothrow) NotifyLogger();
     {
-        HRESULT nr = en->RegisterEndpointNotificationCallback(g_notifier);
+        HRESULT nr = g_notifier ? en->RegisterEndpointNotificationCallback(g_notifier) : E_OUTOFMEMORY;
         Log("notify client registered hr=0x%08X", (unsigned)nr);
     }
 

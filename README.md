@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.4-informational)
+![Version](https://img.shields.io/badge/version-v13.5-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Replaces the game's audio **client** (not its code) so the engine buffer disappears from the path, then renders the game's PCM through a backend of your choice: **ASIO**, **WASAPI exclusive** or **WASAPI shared**.
@@ -69,7 +69,10 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
 registry order and keeps the first one that fully initialises — the log shows each attempt
 and the driver that won, so a machine with several drivers is never silently routed to a
-disconnected or virtual device.
+disconnected or virtual device. Probing really `init()`s each candidate (bounded at 8), and
+some drivers pop a control panel or briefly claim the device while that happens, so on a
+machine with several ASIO drivers (ASIO4ALL, FlexASIO, virtual mixers, …) run `asio_list`
+once and pin the interface's name in `asio_driver` to skip the probe.
 
 ### 3. Anti-tamper safe
 
@@ -142,7 +145,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.4` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.5` and `MODE: v13 takeover`.
 
 ---
 
@@ -165,7 +168,7 @@ mute_mode   = 1
 | `fake_client` | `1` | Replace CRI's stream1 client with ours. **Required** for any non-ASIO backend; without it you get the old v11 behaviour. |
 | `output` | `asio` | `asio` / `shared` / `excl`. |
 | `asio` | `1` | Enable the ASIO worker when `output = asio`. |
-| `asio_driver` | `*` | Case-insensitive substring match against the names listed by `asio_list`. `*` (or `auto`, or empty) = **first driver that actually initialises**: every registered driver is tried in turn until one reports ≥2 outputs, 44.1 kHz and a usable sample format. Pin the exact name when several drivers are installed. |
+| `asio_driver` | `*` | Case-insensitive substring match against the names listed by `asio_list`. `*` (or `auto`, or empty) = **first driver that actually initialises**: every registered driver is tried in turn until one reports ≥2 outputs, 44.1 kHz and a usable sample format. Each probe calls the driver's `init()`, which can pop a control panel or briefly claim the device — pin the exact name (from `asio_list`) when several drivers are installed. |
 | `block` | `64` | ASIO block size (16…1024). |
 | `handoff_ms` | `0` | Handoff delay; `0` = auto. |
 | `mute_mode` | `1` | `1` = tap-and-zero handoff; `0` = legacy `SetMute`. |
@@ -180,7 +183,7 @@ Loads the ASIO driver on an **STA** worker thread, taps CRI's PCM directly from 
 
 ### `shared` (no ASIO driver required)
 
-Opens a normal WASAPI shared stream on the default endpoint (mix format, float32 or 16-bit) and writes the frames the ring currently holds. This keeps the engine's ~22 ms buffer in the path — that buffer is a platform floor, not something a client can shrink — but it removes CRI's own buffer and works everywhere.
+Opens a normal WASAPI shared stream on the default endpoint (mix format, float32 or 16-bit) and writes the frames the ring currently holds. A mix format of 24-bit packed or 32-bit *integer* PCM is refused (the log says `refusing`, and the mod falls back to `asio`) — writing it as int16 would be full-scale noise. This keeps the engine's ~22 ms buffer in the path — that buffer is a platform floor, not something a client can shrink — but it removes CRI's own buffer and works everywhere.
 
 If the endpoint is **not 44.1 kHz** (48 kHz HDMI / Bluetooth / onboard is common), the backend resamples 44.1 kHz → device rate with linear interpolation (≈1 frame of latency, inaudible at these ratios) instead of playing the whole game 8.8 % fast. The log line says `resample=yes`.
 
@@ -193,7 +196,7 @@ The catch is driver quality. Of the devices tested so far:
 - one USB interface — initialises with 221 frames, but the **device clock advances at 88.5 %** of nominal;
 - one onboard codec — initialises with 480 frames at 48 kHz, but the **device clock stays at ~0.3 %**.
 
-Both would starve the queue and make the music stutter, so v13 measures 600 ms at startup and rolls back to `shared` when the rate is under 95 %. Use `tools/excl_rate_probe.exe` to check your own device:
+Both would starve the queue and make the music stutter, so v13 measures 600 ms at startup and rolls back to `shared` when the rate is under 95 %. After that fall-back, exclusive is **not re-attempted** for the rest of the process — the watchdog only rebuilds `shared` — so changing `output = excl` to stick requires a game restart. Use `tools/excl_rate_probe.exe` to check your own device:
 
 ```
 excl_rate_probe --list
@@ -220,7 +223,7 @@ CRI ADX2 mix ──▶ [our IAudioClient]  (GetBuffer / ReleaseBuffer, 441 frame
 1. `Initialize` for stream1 is intercepted; the real one is skipped and our vtable slots are installed.
 2. `GetService(IAudioRenderClient)` returns our render client; `Start` launches the driver thread.
 3. Each output callback pulls from the ring and, when the queue runs low, signals CRI's event so it mixes the next chunk.
-4. Because the signal comes from the real output clock, production and consumption are locked together — no resampling, no drift.
+4. Because the signal comes from the real output clock, production and consumption are locked together — no clock drift (the `shared` backend resamples only to convert 44.1 kHz → device rate, never to chase drift).
 5. A monitor thread reports callbacks / underruns / queue depth once per second.
 
 ---
