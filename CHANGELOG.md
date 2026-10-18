@@ -32,6 +32,15 @@ UINT32 n = free_ < avail ? free_ : avail;
 reports `music/total = 72.6 %` (and `50.0 %` at 22.05 kHz) against the old formula and
 `100.0 %` against the fixed one, so this cannot regress silently again.
 
+### Fixed — 24-bit ASIO output wrote the wrong byte (N27)
+
+`WriteSamples` converted 16-bit samples to 24-bit with `<< 16`. The three stored
+bytes are bits 0-23 of that word, i.e. **bits 16-31 of the shifted value** — only
+the sample's low byte survived: values below 256 became silence, 16384 became 0,
+32767 wrapped to a tiny value. It is `<< 8` (the `asio_list` copy always had it
+right). Focusrite reports `ASIOSTInt32LSB` (type 18), which is why neither audit
+run heard it; a driver reporting type 17 would have been silent.
+
 ### Fixed — smaller accuracy issues in the same file
 
 - **N3** — when the client takeover fails and the mod falls back to the real
@@ -57,6 +66,9 @@ reports `music/total = 72.6 %` (and `50.0 %` at 22.05 kHz) against the old formu
   refused (the old build played silence when `getChannelInfo` failed); a reported
   `maxBufferSize` of 0 can no longer produce a block size of 0.
 - Registry entries without a `clsid` are skipped instead of being listed as unplayable.
+- An in-flight counter now guards `disposeBuffers()`: `stop()` does not promise that
+  `bufferSwitch` has returned, and a callback writing into freed buffers runs on the
+  driver's thread — outside the tool's `__try`. It waits 200 ms, then leaks instead.
 - Exit codes: 0 ok · 1 no drivers · 2 failed/no match · 3 usage · 4 driver crashed.
 
 **`excl_rate_probe`**
@@ -72,8 +84,13 @@ reports `music/total = 72.6 %` (and `50.0 %` at 22.05 kHz) against the old formu
   alignment error is reported per candidate.
 - Device names are UTF-8 (they printed as `?????`); `--seconds` is validated and clamped
   to 1…60; unknown options are usage errors.
-- Falls back to the written rate when a driver has no usable `IAudioClock` instead of
-  reporting 0 %.
+- Falls back to the written rate only when there is **no** `IAudioClock` object; a clock
+  that exists but never advances is now scored 0 % and labelled `(clock not advancing)`,
+  which is the actual failure mode being hunted.
+- Counts the pre-filled buffer in `written` (it is delivered too), so short runs no
+  longer under-report by one buffer.
+- Offers **24-in-32** candidates (`wValidBitsPerSample = 24`, 32-bit container): pro
+  interfaces often accept only that, and the old table always set valid == container.
 - Exit codes: 0 measured ≥ 95 % · 3 below that / nothing worked · 1 device error · 2 usage.
 
 **`session_tool`**
@@ -85,8 +102,11 @@ reports `music/total = 72.6 %` (and `50.0 %` at 22.05 kHz) against the old formu
 - Checks `EnumAudioEndpoints` / `GetSessionEnumerator` / `GetCount` instead of assuming
   success; missing arguments and unknown flags are usage errors; the system-sounds session
   (`pid 0`) is never muted by a pattern.
-- The report is written next to the exe instead of the current directory, and processes
-  that cannot be queried show `(denied)` rather than `(gone)`.
+- The report is written next to the exe (append + 4 MB rotation to
+  `session_tool_report.1.txt`), and a read-only folder now produces a warning instead of
+  silently no report. Process names are read as UTF-16 and printed as UTF-8, so an exe
+  with a non-ASCII name can still be matched by `--unmute`.
+- Processes that cannot be queried show `(denied)` rather than `(gone)`.
 
 ### Build
 

@@ -91,6 +91,8 @@ struct RateResult
     double clock;       /* device clock advance in NOMINAL frames/s (0 = n/a) */
     double pct;         /* percentage of real time */
     int    usedClock;   /* pct came from the device clock, not from writes */
+    int    clockPresent;/* the driver exposed IAudioClock at all */
+    int    clockStalled;/* the clock exists but did not advance */
     UINT64 clockFreq;   /* IAudioClock units per second (0 = no clock object) */
     char   err[96];
 };
@@ -128,11 +130,15 @@ static void RunOne(IAudioClient* cl, WAVEFORMATEX* wf, UINT32 bufFrames,
 
     UINT32 bpf = wf->nBlockAlign ? wf->nBlockAlign : 4;
 
+    /* the pre-filled buffer is delivered too - it used to be left out of the
+       frame count, which under-reported the rate by one buffer per run */
+    unsigned long long frames = 0;
     BYTE* p0 = NULL;
     if (SUCCEEDED(rc->GetBuffer(bufFrames, &p0)) && p0)
     {
         memset(p0, 0, (size_t)bufFrames * bpf);
         rc->ReleaseBuffer(bufFrames, 0);
+        frames += bufFrames;
     }
 
     hr = cl->Start();
@@ -146,9 +152,14 @@ static void RunOne(IAudioClient* cl, WAVEFORMATEX* wf, UINT32 bufFrames,
     }
 
     UINT64 c0 = 0, ckFreq = 0;
-    if (ck) { ck->GetPosition(&c0, NULL); ck->GetFrequency(&ckFreq); }
+    int clockPresent = 0;
+    if (ck)
+    {
+        clockPresent = 1;
+        ck->GetPosition(&c0, NULL);
+        ck->GetFrequency(&ckFreq);
+    }
 
-    unsigned long long frames = 0;
     double t0 = Now();
     for (;;)
     {
@@ -173,7 +184,8 @@ static void RunOne(IAudioClient* cl, WAVEFORMATEX* wf, UINT32 bufFrames,
 
     res->ok      = 1;
     res->written = (double)frames / el;
-    res->clockFreq = ckFreq;
+    res->clockFreq  = ckFreq;
+    res->clockPresent = clockPresent;
 
     /* IAudioClock counts in ITS OWN units, and GetFrequency() is the only way
        to know how many of those units are one second. Assuming "units ==
@@ -181,15 +193,25 @@ static void RunOne(IAudioClient* cl, WAVEFORMATEX* wf, UINT32 bufFrames,
        8x nominal, which made a perfectly healthy device look like 784 %. */
     double nominal = (double)wf->nSamplesPerSec;
     double clockUnits = (ck && c1 > c0) ? (double)(c1 - c0) / el : 0.0;
-    if (ckFreq > 0 && clockUnits > 0.0)
+    if (clockPresent && ckFreq > 0 && clockUnits > 0.0)
     {
         res->pct = 100.0 * clockUnits / (double)ckFreq;             /* real-time %  */
         res->clock = clockUnits * nominal / (double)ckFreq;         /* in frames    */
         res->usedClock = 1;
     }
+    else if (clockPresent)
+    {
+        /* The object exists but the position never moved: that IS the failure
+           mode we are looking for, so score it 0 % - do not fall back to the
+           written rate, which would make a dead device look healthy. */
+        res->pct = 0.0;
+        res->clock = 0.0;
+        res->usedClock = 1;
+        res->clockStalled = 1;
+    }
     else
     {
-        res->pct = 100.0 * res->written / nominal;                  /* fallback     */
+        res->pct = 100.0 * res->written / nominal;                  /* no clock obj */
         res->clock = 0.0;
         res->usedClock = 0;
     }
@@ -253,7 +275,10 @@ int main(int argc, char** argv)
         else if (!_stricmp(argv[i], "--seconds"))
         {
             if (i + 1 >= argc) { fprintf(stderr, "!! --seconds needs a value\n"); Usage(); return 2; }
-            seconds = atoi(argv[++i]);
+            char* end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end) { fprintf(stderr, "!! --seconds '%s' is not a number\n", argv[i]); Usage(); return 2; }
+            seconds = (int)v;
         }
         else if (argv[i][0] == '-') { fprintf(stderr, "!! unknown option '%s'\n", argv[i]); Usage(); return 2; }
         else if (!want) want = argv[i];
@@ -374,7 +399,8 @@ int main(int argc, char** argv)
                     {
                         printf("   -> written %.0f fr/s, device clock %.0f fr/s (%llu units/s)%s\n",
                                r.written, r.clock, (unsigned long long)r.clockFreq,
-                               r.usedClock ? "" : " [no usable clock]");
+                               r.clockStalled ? " [clock not advancing]" :
+                               (r.usedClock ? "" : " [no clock object]"));
                         printf("\n== SUMMARY '%s'  [SHARED]\n", devName);
                         printf("   %s %.1f%% of real time (%u Hz)\n",
                                r.usedClock ? "device clock:" : "written rate:", r.pct, rate);
@@ -386,13 +412,16 @@ int main(int argc, char** argv)
     }
     else
     {
-        struct Cand { int rate, bits, ch, flt; };
+        struct Cand { int rate, bits, ch, flt, valid; };
         Cand cand[] = {
             /* 44.1 kHz first: that is what the game runs at, so a hit here is
-               the directly useful answer */
-            { 44100, 16, 2, 0 }, { 48000, 16, 2, 0 },
-            { 44100, 24, 2, 0 }, { 48000, 24, 2, 0 },
-            { 44100, 32, 2, 1 }, { 48000, 32, 2, 1 },
+               the directly useful answer. `bits` is the CONTAINER size, `valid`
+               the significant bits - pro interfaces often accept only 24-in-32,
+               which the old table (wValidBits = bits) never offered. */
+            { 44100, 16, 2, 0, 16 }, { 48000, 16, 2, 0, 16 },
+            { 44100, 24, 2, 0, 24 }, { 48000, 24, 2, 0, 24 },
+            { 44100, 32, 2, 0, 24 }, { 48000, 32, 2, 0, 24 },
+            { 44100, 32, 2, 1, 32 }, { 48000, 32, 2, 1, 32 },
         };
         const int NCAND = (int)(sizeof(cand) / sizeof(cand[0]));
 
@@ -422,11 +451,12 @@ int main(int argc, char** argv)
             wfx.Format.nBlockAlign     = (WORD)(cand[i].ch * cand[i].bits / 8);
             wfx.Format.nAvgBytesPerSec = cand[i].rate * wfx.Format.nBlockAlign;
             wfx.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-            wfx.Samples.wValidBitsPerSample = (WORD)cand[i].bits;
+            wfx.Samples.wValidBitsPerSample = (WORD)cand[i].valid;
             wfx.dwChannelMask = 0x3;
             wfx.SubFormat = cand[i].flt ? kSubFloat : kSubPCM;
 
-            printf("\n-- %d Hz / %d bit / %d ch --\n", cand[i].rate, cand[i].bits, cand[i].ch);
+            printf("\n-- %d Hz / %d%s bit / %d ch --\n", cand[i].rate,
+                   cand[i].valid, (cand[i].valid != cand[i].bits) ? "-in-32" : "", cand[i].ch);
 
             WAVEFORMATEX* closest = NULL;
             HRESULT chk = cl->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &wfx.Format, &closest);
@@ -473,7 +503,8 @@ int main(int argc, char** argv)
 
             printf("   -> written %.0f fr/s, device clock %.0f fr/s%s\n",
                    r.written, r.clock,
-                   r.usedClock ? "" : " (no usable clock)");
+                   r.clockStalled ? " (clock not advancing)" :
+                   (r.usedClock ? "" : " (no clock object)"));
 
             if (bestIdx < 0 || r.pct > best.pct)
             {
@@ -489,9 +520,12 @@ int main(int argc, char** argv)
                    "   initialize or could not be measured.\n");
         else
         {
-            printf("   best: %d Hz / %d bit / %d ch  buffer %u fr  ->  %.1f%% of real time%s\n",
-                   cand[bestIdx].rate, cand[bestIdx].bits, cand[bestIdx].ch, bestFrames,
-                   best.pct, best.usedClock ? "" : " (from written frames)");
+            printf("   best: %d Hz / %d%s bit / %d ch  buffer %u fr  ->  %.1f%% of real time%s\n",
+                   cand[bestIdx].rate, cand[bestIdx].valid,
+                   (cand[bestIdx].valid != cand[bestIdx].bits) ? "-in-32" : "",
+                   cand[bestIdx].ch, bestFrames, best.pct,
+                   best.clockStalled ? " (clock not advancing)" :
+                   (best.usedClock ? "" : " (from written frames)"));
             if (best.pct >= 95.0) exitCode = 0;
         }
     }

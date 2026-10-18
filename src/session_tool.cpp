@@ -91,18 +91,23 @@ static void GetProcName(DWORD pid, char* out, size_t cch)
         strncpy_s(out, cch, (e == ERROR_ACCESS_DENIED) ? "(denied)" : "(gone)", _TRUNCATE);
         return;
     }
-    DWORD n = (DWORD)cch;
-    if (!QueryFullProcessImageNameA(h, 0, out, &n) || n == 0)
+    /* W + UTF-8: the ANSI variant turned a non-ASCII exe name into '?', which
+       made --unmute <name> impossible to match on such installs */
+    wchar_t wpath[MAX_PATH] = { 0 };
+    DWORD n = MAX_PATH;
+    if (!QueryFullProcessImageNameW(h, 0, wpath, &n) || n == 0)
         strncpy_s(out, cch, "?", _TRUNCATE);
     else
-        out[cch - 1] = 0;
+        WideToUtf8(wpath, out, cch);
     CloseHandle(h);
     const char* bs = strrchr(out, '\\');
     if (bs) memmove(out, bs + 1, strlen(bs + 1) + 1);
 }
 
 /* The report goes next to the exe, not into whatever directory the user
-   happened to start the tool from (Program Files is read-only for non-admins). */
+   happened to start the tool from (Program Files is read-only for non-admins).
+   Append + 4 MB rotation, same rule as audio_hook.log: the run that matters is
+   usually the one that just failed. */
 static void OpenReport(void)
 {
     char path[MAX_PATH] = { 0 };
@@ -110,8 +115,27 @@ static void OpenReport(void)
     char* slash = strrchr(path, '\\');
     if (slash) *(slash + 1) = '\0';
     else path[0] = '\0';
-    strncat_s(path, sizeof(path), "session_tool_report.txt", _TRUNCATE);
-    fopen_s(&g_report, path, "wb");
+
+    char file[MAX_PATH] = { 0 };
+    strncpy_s(file, sizeof(file), path, _TRUNCATE);
+    strncat_s(file, sizeof(file), "session_tool_report.txt", _TRUNCATE);
+
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA(file, GetFileExInfoStandard, &fa) &&
+        fa.nFileSizeHigh == 0 && fa.nFileSizeLow > (4u << 20))
+    {
+        char old[MAX_PATH] = { 0 };
+        strncpy_s(old, sizeof(old), path, _TRUNCATE);
+        strncat_s(old, sizeof(old), "session_tool_report.1.txt", _TRUNCATE);
+        DeleteFileA(old);
+        MoveFileA(file, old);
+    }
+
+    if (fopen_s(&g_report, file, "ab") != 0 || !g_report)
+    {
+        g_report = NULL;
+        fprintf(stderr, "!! cannot write %s (read-only folder?) - console output only\n", file);
+    }
 }
 
 static void Usage(void)

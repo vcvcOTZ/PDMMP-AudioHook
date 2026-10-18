@@ -407,7 +407,10 @@ static void WriteSamples(void* p, long type, int ch, const short* src, unsigned 
     case ASIOSTInt24LSB: {
         unsigned char* o = (unsigned char*)p;
         for (i = 0; i < total; i++) {
-            int32_t v = (i < got) ? (((int32_t)src[i * 2 + ch]) << 16) : 0;
+            /* 16-bit -> 24-bit is <<8, NOT <<16: with <<16 only bits 16..23 of the
+               word are stored, i.e. the LOW byte of the sample, so every value
+               below 256 became silence and 16384 became 0 (audit N27). */
+            int32_t v = (i < got) ? (((int32_t)src[i * 2 + ch]) << 8) : 0;
             o[i * 3] = (unsigned char)v; o[i * 3 + 1] = (unsigned char)(v >> 8); o[i * 3 + 2] = (unsigned char)(v >> 16);
         }
     } break;

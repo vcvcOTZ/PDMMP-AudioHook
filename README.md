@@ -298,9 +298,12 @@ A name that matches **nothing is an error** (`exit 2`, the registered names are 
 it is never silently redirected to the first driver, which used to let you "verify" the
 wrong device.
 
-Drivers that crash on load (some Ableton builds do) are caught with SEH and reported as
-`driver crashed` — one bad driver cannot take down the tool, and each test now closes its
-stream (`stop` → `disposeBuffers` → `Release`) so the next driver really gets the device.
+Drivers that crash while **loading or initialising** (some Ableton builds do) are caught
+with SEH and reported as `driver crashed`, so one bad driver does not stop you from testing
+the rest. Each test closes its stream (`stop` → `disposeBuffers` → `Release`) and waits for
+the audio callback to leave before freeing the buffers, so the next driver really gets the
+device. (A driver that faults *inside its own callback* runs on its own thread, outside our
+SEH frame — that can still take the process down; nothing in user mode can prevent it.)
 
 ### `excl_rate_probe` — is exclusive mode real on this device?
 
@@ -311,8 +314,8 @@ excl_rate_probe "<device substring>" [--seconds N] [--shared]
 
 Defaults: the **default render endpoint**, **2 s per format** (`--seconds` accepts 1…60;
 a bad value or an unknown option is a usage error, not silently ignored). It tries every
-plausible format (44.1 / 48 kHz × 16 / 24 / 32-bit float), re-activates the client for
-each one, and only trusts a format if the **device clock really advances** —
+plausible format (44.1 / 48 kHz × 16 / 24 / 24-in-32 / 32-bit float), re-activates the
+client for each one, and only trusts a format if the **device clock really advances** —
 `Initialize()` returning `S_OK` proves nothing.
 
 Exit codes: `0` measured ≥ 95 % of real time · `3` measured below that (or nothing
@@ -334,6 +337,7 @@ worked) · `1` device/COM error · `2` bad command line.
 | `(352800 units/s)` | the clock's own tick rate; `GetFrequency()` is used to normalise it |
 | `not supported (0x88890008)` | the driver refuses that format in exclusive mode |
 | `Initialize 0x88890019` | buffer size not aligned — that candidate is skipped |
+| `(clock not advancing)` | the clock object exists but its position never moved — scored 0 % |
 
 > Device clocks do **not** count in samples at the nominal rate: a shared-mode stream on
 > the test machine reports **352800 units/s** (8× 44.1 kHz). The tool divides by
@@ -364,8 +368,9 @@ session_tool --mute <substr>    set mute (diagnostic only)
 The match is **case-insensitive** (`divamegamix` works), the system-sounds session
 (`pid 0`) is never touched, and the exit code is `2` when a pattern matched nothing —
 so a script can tell "unmuted" from "the game was not running". A plain-text report is
-written next to the exe (`session_tool_report.txt`), and device names are printed as
-UTF-8, so Chinese/Japanese endpoint names are readable.
+appended next to the exe (`session_tool_report.txt`, rotated to
+`session_tool_report.1.txt` at 4 MB), and both device and process names are printed as
+UTF-8, so Chinese/Japanese names are readable and still matchable.
 
 ```
 == device '扬声器 (4- Focusrite USB Audio)' [{...}]

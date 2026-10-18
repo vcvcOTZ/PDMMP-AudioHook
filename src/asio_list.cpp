@@ -68,6 +68,7 @@ static double          g_env = 0.0;      /* fade-in envelope 0..1 */
 static double          g_envStep = 0.0;
 static volatile LONG   g_playing = 0;
 static int             g_postOut = 0;    /* driver accepts outputReady() */
+static volatile LONG   g_busy = 0;       /* inside cbBufferSwitch */
 
 /* bytes per sample for the formats this tool can render; 0 = unsupported */
 static size_t FrameBytes(long type)
@@ -121,6 +122,7 @@ static void WriteTone(void* p, long type, long block, double ph0)
 static void cbBufferSwitch(long index, ASIOBool direct)
 {
     (void)direct;
+    InterlockedIncrement(&g_busy);
     if (g_playing)
     {
         /* Same starting phase for both channels, advanced ONCE per buffer. */
@@ -142,6 +144,7 @@ static void cbBufferSwitch(long index, ASIOBool direct)
         }
     }
     if (g_postOut && g_asio) g_asio->outputReady();
+    InterlockedDecrement(&g_busy);
 }
 
 static long cbAsioMessage(long selector, long value, void* msg, double* opt)
@@ -319,13 +322,26 @@ static int TestTone(const char* clsid, int seconds)
     /* Always close the driver: stop the stream, free the buffers, drop the COM
        reference (there is no IASIO::exit() - ASIOExit() only exists for hosts
        that link the driver DLL directly). Skipping disposeBuffers() left the
-       previous driver's memory (and sometimes the device) claimed. */
+       previous driver's memory (and sometimes the device) claimed.
+
+       stop() does NOT guarantee that bufferSwitch has returned (driver
+       implementations differ), and a callback writing into buffers we just
+       freed is a use-after-free on the driver's thread - outside our __try.
+       Wait for the in-flight counter to reach 0 first. */
     InterlockedExchange(&g_playing, 0);
     if (asio)
     {
         __try {
             if (started) asio->stop();
-            if (buffers) asio->disposeBuffers();
+            if (buffers)
+            {
+                for (int i = 0; i < 200 && g_busy; i++) Sleep(1);
+                if (!g_busy) asio->disposeBuffers();
+                else
+                {
+                    if (r == 0) { r = 2; strcpy_s(g_lastErr, "callback still running - buffers leaked"); }
+                }
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             if (r == 0) { r = 2; strcpy_s(g_lastErr, "driver faulted while shutting down"); }
