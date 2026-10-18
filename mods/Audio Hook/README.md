@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.3-informational)
+![Version](https://img.shields.io/badge/version-v13.4-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 Replaces the game's audio **client** (not its code) so the engine buffer disappears from the path, then renders the game's PCM through a backend of your choice: **ASIO**, **WASAPI exclusive** or **WASAPI shared**.
@@ -142,7 +142,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.3` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.4` and `MODE: v13 takeover`.
 
 ---
 

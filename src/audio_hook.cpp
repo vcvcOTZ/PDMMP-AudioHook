@@ -1,5 +1,5 @@
 ﻿/*
- * audio_hook.cpp -- PDMMP audio hook (v13.3 build, 2026-10-18, CURRENT SOURCE)
+ * audio_hook.cpp -- PDMMP audio hook (v13.4 build, 2026-10-18, CURRENT SOURCE)
  * ---------------------------------------------------------------------------
  * Two independent layers:
  *
@@ -2434,7 +2434,7 @@ extern "C" __declspec(dllexport) void PreInit(void)
     if (!g_log) return;
 
     Log("============================================================");
-    Log(" audio_hook v13.3 (fake stream1 client: no engine buffer, device free)");
+    Log(" audio_hook v13.4 (fake stream1 client: no engine buffer, device free)");
     Log(" build %s %s", __DATE__, __TIME__);
     Log(" hooks: [3]Initialize [14]GetService [13]SetEventHandle(fake only)");
     Log("============================================================");

@@ -3,8 +3,31 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.3`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.3.4`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [13.4] — 2026-10-18
+
+Fourth-pass review fixes: two defects in `audio_hook.cpp` found in a fresh read-through
+(the three companion tools were re-checked and are clean).
+
+### Fixed
+
+- **`FakeDriverThread` idle-drain buffer overflow.** The idle drain used a `static short
+  tmp[512]` (256 stereo frames) but can drain `n = (a < FAKE_CHUNK) ? a : FAKE_CHUNK/2`
+  with `RingAvail()` capped at `FAKE_FRAMES` by `GetBuffer`'s back-pressure. A 257..440-frame
+  chunk (partial fill / song tail) wrote up to 880 shorts into a 512-short buffer, corrupting
+  adjacent BSS. Sized to `FAKE_CHUNK * 2` (441 frames).
+- **Detach report `%lld` misread.** `WriteDetachReport` formatted two 64-bit counters with
+  `wsprintfA "%lld"`, but `wsprintfA` only understands `%l` and `%I64`, so `taps`/`zeroed`
+  printed garbage and shifted every following argument. Switched to `%I64d`, which keeps the
+  DllMain detach path free of CRT dependencies.
+
+### Build
+
+`/W3` and `/W4`: zero warnings.
 
 ---
 
