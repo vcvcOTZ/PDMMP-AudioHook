@@ -3,8 +3,133 @@
 All notable changes to **Audio Hook** for *Hatsune Miku: Project DIVA Mega Mix+*.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are the
-DLL build tags. The mod manifest version in `config.toml` (`0.3.10`) is tracked separately
+DLL build tags. The mod manifest version in `config.toml` (`0.4.0`) is tracked separately
 and only marks packaging changes.
+
+---
+
+## [14.0] — 2026-10-20
+
+The release that settles `excl` for good. The exclusive backend is rebuilt as a
+**push-mode** writer with a closed-loop fill target instead of the old event-callback one,
+and its monitor is moved off the game's init thread. That is what makes `excl` **stable and
+usable** rather than experimental — it is no longer described as "not a recommended path".
+`asio` is still the default, and the same pass fixed a set of correctness, timing and
+packaging items across the hook.
+
+### Changed — `excl` is now a push-mode writer, and stable enough to use
+
+The event-callback backend was the structural problem: in exclusive mode `duration` must
+equal `periodicity`, so the buffer is exactly one period deep and the deadline after every
+event is **zero** — any missed wake-up loses that beat, and the engine skips it rather than
+substituting silence, so the device clock itself runs slow and the whole timeline (music
+and chart together) drifts against real time. `WoPushThread` now polls every millisecond
+and tops the device up to `excl_target_ms` of **not-yet-heard** audio (device fill plus
+ring backlog), with a device-fill floor so the device is always fed first and can never be
+left thin. The writer runs under MMCSS "Pro Audio" with `AVRT_PRIORITY_CRITICAL` and holds
+12 ms (configurable, 6-30 ms) as the steady-state latency. Measured: **99.9 % delivery,
+zero injected silence**, with or without six CPU-hogging background threads, and without
+needing MMCSS (which stays enabled regardless).
+
+- README / README.zh-CN / `audio_hook.txt`: the `excl` description changed from
+  experiment / "not a recommended path" to **stable and usable**. It still claims the
+  endpoint exclusively, so movie (stream2) audio is silent, and `asio` remains the default.
+- Device health is judged on a **99.5 %-for-three-consecutive-seconds** rolling window that
+  runs on the watchdog thread, replacing the 2 s / 90 % self-test gate; a healthy session is
+  never torn down by a self-test transient again. `[wo] ready: EXCLUSIVE` lands ~83 ms after
+  the game's `Initialize`, so `output = excl` no longer adds ~2.2 s of silence to the title
+  screen (the self-test no longer runs on the game's init thread).
+- The target fill is adjusted with hysteresis in the sane direction: two consecutive
+  sub-99.5 % seconds raise it 2 ms (capped at 30), ten clean seconds lower it 1 ms, and it
+  never goes below the configured value. The window is timed with `QueryPerformanceCounter`,
+  **not** `GetTickCount64` (whose ~15.6 ms tick let the old reading walk the target upward on
+  pure noise, which showed up as the music drifting further and further behind the chart).
+- Exclusive **format negotiation** tries 44.1 kHz 16-bit first (no resampling), then 32-bit
+  float, then the device's own mix rate with either, so an endpoint that only answers
+  48 kHz or float in exclusive mode no longer fails outright; the shared backend's
+  resampler handles any rate difference.
+- `excl_period_ms`, when set, is the requested **buffer depth** (ms); `0` asks for 20 ms and
+  the engine rounds it up (80 ms / 3528 frames in the plan's measurements). It no longer
+  describes an event period.
+- Some devices are genuinely unusable: one onboard codec initialises but never moves its
+  device clock (~0.3 %) and is still rolled back to `shared`. After a genuine fall-back,
+  exclusive is **not re-attempted** for the rest of the process — the watchdog only rebuilds
+  `shared` — so a restart is required to re-try it.
+
+### Fixed — `excl` could double the output on exit
+
+On quit the exclusive writer used to truncate each write to what the ring actually held, so
+once the game stopped producing it drained the device towards empty — the device fired its
+stop event, the watchdog read the device clock as 0 % and rolled back, rebuilding a second
+audio path alongside the one still finishing. Push mode no longer truncates by ring
+content: it always tops the device up to the target and pads the shortfall with silence, so
+the device stays fed through shutdown. The "fake driver stopped" case now skips the rollback
+verdict entirely (a stopped fake clock is not a slow device), and the detach log is flushed
+so the exit sequence is readable.
+
+### Fixed — `FakeRC` polled instead of waiting on the ring's event (`P0-1`)
+
+`GetBuffer` waited for room with a spin, and the poll window was too short once the staging
+ring was enlarged. The fake render client now waits on an event the writer signals, and the
+staging ring capacity is raised from 441 to **882 frames** so a wake-up always has room to
+hand out.
+
+### Fixed — `WoShutdown` could race a start (`P0-4`)
+
+Two threads could pass the "already shut down" check together. The state transition is a
+compare-exchange now, so a teardown can never interleave with a fresh `Start()`.
+
+### Fixed — the fake clock's position could lag (`P1-1`)
+
+The position calculation subtracted the same padding twice across a call boundary, so
+`FakeClock::GetPosition` drifted behind the frames actually consumed. The arithmetic is
+corrected so the reported position tracks delivery exactly.
+
+### Fixed — two consumers could drain the ring at playback start (`P1-2`)
+
+The idle fake-driver drain and a just-started backend could both `RingRead` the one ring for
+a tick at song start (torn, half-speed audio). The ring consumer is now claimed before
+playback begins which, together with the producer-idle guard, keeps a single consumer.
+
+### Fixed — ASIO could be held off by a silent start window (`P1-3`)
+
+`WaitForTapSteady` required the game to be producing audio before ASIO started, so a launch
+that stayed silent (a menu, a long load) kept ASIO waiting. It now only requires *any* output
+to have been seen, with a bounded silence grace window, so ASIO comes up instead of stalling.
+
+### Added — the missing `IAudioClock2` / `IAudioStreamVolume` services (`P1-5`)
+
+The fake client's `GetService` did not answer these two interfaces. `IAudioClock2` (with
+`GetDevicePosition`) and `IAudioStreamVolume` are now provided, so a game component that
+asks for them no longer gets a failure it has to work around.
+
+### Added — a patch journal with safe recovery (`P0-2`)
+
+Slot patches are recorded in a journal before they are applied and rolled back from it if
+any slot fails, and the detach / recovery work is done on the watchdog thread rather than
+from `DllMain`, where COM calls are unsafe.
+
+### Changed — smaller correctness, logging and performance items
+
+- The lock-free ring's cursor publishes and the backend state use atomic operations where a
+  plain store could tear (`P2-5`).
+- Logging is batched — one flush per 32 lines or 200 ms — instead of flushing every line
+  (`P2-1`), and repetitive failure lines (render-client, notification) are throttled
+  (`P2-2`).
+- The outdated stream / client is now returned an invalidated error instead of being served
+  (`P2-6`).
+- `FakePoke` is not re-issued when a poke is already pending (`P2-3`), and the interleave
+  conversion has an SSE2 fast path (`P2-4`).
+
+### Docs
+
+- README / README.zh-CN: version badge, boot-banner string, and the `excl` framing across the
+  features table, buffer-size note, backend section, portability list and known-limitations
+  bullet — all now describe `excl` as stable and usable. `config.toml` → 0.4.0.
+
+### Build
+
+`/W4`: zero warnings (DLL).
 
 ---
 

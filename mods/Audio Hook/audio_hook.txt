@@ -4,8 +4,9 @@
 #               ★ 低延迟的核心开关，必须为 1 才能用 output 后端
 # output      : asio   = ASIO 直通（推荐，延迟最低，软件链路 ≈10ms）
 #               shared = WASAPI 共享（没有 ASIO 驱动时用；受引擎 22ms 缓冲限制）
-#               excl   = WASAPI 独占（实验性：交付率受系统/后台负载影响，常 <95% 自动回退
-#                        shared，不推荐；低延迟请用 asio）
+#               excl   = WASAPI 独占（v14.0 起为 push 模式 + 目标水位，实测 99.9% 交付，
+#                        延迟 ≈ excl_target_ms；自 v14.0 起较稳定、可使用，默认仍为 asio）
+#                        设备被独占占用，影片音轨(stream2)会初始化失败 → 过场静音
 # asio        : output=asio 时是否启用 ASIO 后端（1 = 启用）
 # asio_driver : "*" = 自动：按注册表顺序逐个尝试，选第一个能完整初始化的驱动（默认）
 #               机器上装了多个 ASIO 驱动时，先运行 tools\asio_list.exe —— ↑↓ 选择、回车试听，
@@ -13,8 +14,11 @@
 # block       : ASIO 块大小 16..1024（64 = 1.45ms）
 # handoff_ms  : 0 = 自动；>0 = 手动覆盖
 # mute_mode   : 1 = tap-and-zero 无缝交接（推荐）；0 = 旧 SetMute（对照用）
-# excl_period_ms : 仅 output=excl 生效：独占周期(ms)。0 = 设备默认(10)，也是唯一可用值
-#                 高于设备默认的取值会让设备停发事件、后端作废并回退 shared；代码会就此告警
+# excl_period_ms : 仅 output=excl：请求的独占缓冲深度(ms)。0 = 自动(20ms)
+#                 旧的"事件周期"含义已废弃——v14.0 起独占不再用事件回调
+# excl_target_ms : 仅 output=excl：push 写者的目标水位(ms)，6..30，默认 12
+#                 这就是稳定态的实际延迟。只有连续两秒欠载才会自动上调 2ms（上限 30），
+#                 连续十秒干净后每秒回落 1ms，且不会低于这里填的值
 # 急救：同目录放空文件 audio_hook.off
 
 fake_client = 1
@@ -25,3 +29,4 @@ block       = 64
 handoff_ms  = 0
 mute_mode   = 1
 excl_period_ms = 0
+excl_target_ms = 12

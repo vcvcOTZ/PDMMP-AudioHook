@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 ![Game](https://img.shields.io/badge/game-PDMM%2B-7b5cff)
-![Version](https://img.shields.io/badge/version-v13.10-informational)
+![Version](https://img.shields.io/badge/version-v14.0-informational)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
@@ -66,7 +66,7 @@ v13 takes a different route: **CRI is handed a client object owned by this mod.*
 |---|---|
 | `asio` *(default)* | Native ASIO driver. Lowest, most consistent result on the test hardware. |
 | `shared` | Our own WASAPI shared-mode stream. Works on **any** device, no ASIO driver required. |
-| `excl` | WASAPI exclusive at the device's default period (10 ms). Guarded by a **2 s self-test** (run by the watchdog thread, overlapped with playback, and measured against real elapsed time): if the device delivers less than 90 % of real time, the backend is torn down and the mod falls back to `shared`. |
+| `excl` | WASAPI exclusive in **push mode** (no event callbacks) with a target fill of `excl_target_ms`, 12 ms by default. A watchdog monitor compares the **device clock** with the wall clock once a second and falls back to `shared` if it stays below 99.5 % for three seconds. Measured 99.9 % delivery with zero injected silence on the test device; stable and usable since v14.0 — it only costs you the endpoint (movie audio goes silent), and `asio` is still the default. |
 
 With `asio_driver = *` (the default) the ASIO backend tries every registered driver in
 registry order and keeps the first one that fully initialises — the log shows each attempt
@@ -89,7 +89,7 @@ No code bytes are written. The game's own **COM implementation** is replaced (ou
 
 - **All-or-nothing vtable patches.** Both the client takeover (9 slots) and the render-client tap (2 slots) are installed as a set; if any slot cannot be patched, the ones already written are rolled back. A half-patched table used to leave `slot 3 = our hook` while the "patched" flag stayed 0, so the next attempt hooked our own function onto itself (stack overflow).
 - **Staged fallback with real verification:** `output = excl` → `shared` → ASIO. Each stage now *waits* for its thread to report success, so a failed `Start()` no longer looks like a working backend.
-- **Exclusive self-test** (runs on the watchdog thread, overlapped with playback; the window is whatever real time has elapsed, ≥ 2 s) checks both delivered frames and the **device clock** (`IAudioClock`); below 90 % of real time it tears the stream down and falls back.
+- **Exclusive monitor** (watchdog thread, one sample a second): the **device clock** (`IAudioClock`) is compared with the wall clock, and three consecutive seconds below 99.5 % tear the stream down and fall back to `shared`. The bar is that high because the old event-mode backend did not jitter around 96 % — its device clock genuinely ran 3.5 % slow (the engine skips the beat it is not fed, so the whole timeline drifts against real time). The same reading raises the fill target by 2 ms while the writer is starving.
 - **Fake mode has a real fallback:** if ASIO dies while the client is faked, the mod starts the shared backend (`WoStart(0)`) instead of the old "game audio returns via WASAPI", which was impossible with no real stream.
 - **No engine handoff in fake mode:** the tap-and-zero dance (resync + 23 ms wait) is skipped, so starting a song no longer discards ~10 ms of already mixed audio.
 - **Ring memory is allocated unconditionally** and every ring access is NULL-guarded, so `fake_client = 1` + `asio = 0` (previously a guaranteed crash) now works and is auto-corrected to `output = shared`.
@@ -113,11 +113,11 @@ Objective numbers, measured with a USB ASIO interface at 44.1 kHz:
 | ASIO block size | 64 frames = **1.45 ms** |
 | ASIO driver-reported latency | 181 frames in / out = **4.1 ms** |
 | WASAPI shared engine buffer | 970 frames = **22.0 ms** @44.1 kHz (1056 @48 kHz) |
-| WASAPI exclusive period (device default) | 441 frames = **10.0 ms** |
+| WASAPI exclusive, push mode | ≈ **12 ms** (`excl_target_ms`; the granted buffer is 3528 frames = 80 ms, but only the target fill is held) |
 
 Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s delivered, 0 underruns, 0 dropped frames** over 25 s runs.
 
-> Exclusive mode is listed for completeness only — see [Known limitations](#known-limitations). It is not a recommended path.
+> Exclusive mode is **stable and usable** since v14.0: it is a push-mode writer (not event callbacks), which is what brings it to 99.9 % delivery with zero injected silence. It does claim the endpoint exclusively, so movie (stream2) audio is silent, and `asio` remains the default.
 
 ---
 
@@ -147,7 +147,7 @@ Steady-state validation of the `asio` and `shared` backends: **44,100 frames/s d
    priority = ["Audio Hook", "Disable Watermarks", "High Frame Rate", "ExPatch"]
    ```
 
-4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v13.10` and `MODE: v13 takeover`.
+4. Launch the game and check `mods/Audio Hook/audio_hook.log` — the header must read `v14.0` and `MODE: v13 takeover`.
 
 ---
 
@@ -174,7 +174,8 @@ mute_mode   = 1
 | `block` | `64` | ASIO block size (16…1024). |
 | `handoff_ms` | `0` | Handoff delay; `0` = auto. |
 | `mute_mode` | `1` | `1` = tap-and-zero handoff; `0` = legacy `SetMute`. |
-| `excl_period_ms` | `0` | Exclusive backend event period in ms; `0` = device default (10 ms); only `0` works — see the `excl` section. |
+| `excl_period_ms` | `0` | Requested exclusive **buffer depth** in ms; `0` = 20 ms (the engine rounds it up, 80 ms / 3528 frames on the test device). It no longer describes an event period — exclusive is push mode since v14.0. |
+| `excl_target_ms` | `12` | Exclusive push writer's target fill in ms (6…30) — this is the steady-state latency. The watchdog nudges it **up** 2 ms only when the device clock reads below 99.5 % for two seconds in a row, and **down** 1 ms after ten clean seconds; it never goes below the value you set. |
 
 ---
 
@@ -192,23 +193,41 @@ If the endpoint is **not 44.1 kHz** (48 kHz HDMI / Bluetooth / onboard is common
 
 ### `excl`
 
-Opens `AUDCLNT_SHAREMODE_EXCLUSIVE` with `duration == periodicity` (the device's
-default period, typically 10 ms) and event-driven callbacks. Because exclusive mode
-bypasses the engine, the device must be free — and since stream1 no longer opens a real
-stream, it is.
+Opens `AUDCLNT_SHAREMODE_EXCLUSIVE` **without** event callbacks, on a real (multi-period)
+buffer. Because exclusive mode bypasses the engine, the device must be free — and since
+stream1 no longer opens a real stream, it is.
 
-Exclusive's weakness is that its software event loop is **sensitive to system and
-background load**. A clean standalone run (`excl_rate_probe`) can reach ~99.5 % of real
-time, but inside the game it typically delivers **~94.5 %** (and CPU-heavy background
-apps, such as an Android emulator, drag even the standalone probe down to ~96 %). Some
-devices are genuinely unusable: one onboard codec initialises but keeps its device clock
-at **~0.3 %**.
+It also offers several formats in turn instead of only 44.1 kHz / 16-bit: 44.1 kHz 16-bit
+first (no resampling), then 32-bit float, then the device's own mix rate with either — so an
+endpoint that only answers 48 kHz or float in exclusive mode no longer makes the backend fail
+outright. The rate difference is handled by the same resampler the shared backend uses.
 
-So v13 measures the device clock while playing and rolls back to `shared` when the rate is
-under 90 % — which is what exclusive usually does in practice, and why it is not the
-default and not recommended. The writer hands the device a whole period on every event
-(the tail padded with silence), so the device clock keeps moving even before the game
-starts mixing; the self-test then samples the counters over ≥ 2 s of real elapsed time.
+Event callbacks are what used to cap this backend. In exclusive mode they force
+`duration == periodicity`, i.e. a buffer exactly one period deep, so the deadline after
+every event is **zero**: any wake-up that misses the period loses that beat's audio. A
+standalone probe measured **96.5 % while completely idle**, and — the part that made the
+old 90 % gate useless — the *device clock itself* ran 3.5 % slow, because the engine skips
+the beat instead of substituting silence. That is not stutter, it is the whole timeline
+(music and chart together) drifting against real time.
+
+v14.0 drops the event mode entirely. `WoPushThread` polls every millisecond and tops the
+buffer up to `excl_target_ms` of **not-yet-heard** audio — device fill plus ring backlog —
+with a device-fill floor so the device itself is always pulled from first and can never be
+left thin. The plan's measurements: **99.9 % delivery, zero injected silence**, with or
+without six CPU-hogging threads, not even needing MMCSS (which is still enabled because it
+is free). Some devices are genuinely unusable: one onboard codec initialises but keeps its
+device clock at **~0.3 %**.
+
+The watchdog then samples the device clock once a second against the wall clock and rolls
+back to `shared` when it stays below **99.5 %** for three consecutive seconds — a far
+higher bar than the old 90 %, and deliberately so. The same reading drives the fill target,
+with hysteresis in the sane direction: only two consecutive seconds below 99.5 % raise it
+(2 ms at a time, capped at 30), ten clean seconds lower it by 1 ms, and it never drops below
+the configured value. The window is timed with `QueryPerformanceCounter`, **not**
+`GetTickCount64` — the latter ticks at ~15.6 ms, and ±1.6 % of quantisation error over a one
+second window is wider than the deviation being measured; it used to walk the target, and
+with it the whole audio latency, upward on pure noise (which shows up as the music drifting
+further and further behind the chart).
 After a genuine fall-back, exclusive is **not re-attempted** for the rest of the process — the
 watchdog only rebuilds `shared` — so changing `output = excl` to stick requires a game
 restart. Use `tools/excl_rate_probe.exe` to check your own device:
@@ -218,7 +237,7 @@ excl_rate_probe --list
 excl_rate_probe "Speakers" --seconds 2
 ```
 
-The exclusive backend always runs at the device's default period (10 ms). The config key `excl_period_ms` can override the period, but **any** value above the device default makes the device stop firing its event callbacks — the stream is invalidated and the backend falls back to `shared` — so in practice only `0` (the device default) works. Because a 10 ms buffer has no slack, exclusive keeps a small residual risk and remains not recommended (`asio` is the recommended backend).
+`excl_period_ms`, when set, is the requested **buffer depth** in ms; `0` asks for 20 ms and the engine rounds it up (80 ms / 3528 frames in the plan's measurements). `excl_target_ms` is the fill the writer holds, which is the steady-state latency — 12 ms by default. The device is held exclusively either way, so `excl` still costs you movie (stream2) audio; it is still not the default (`asio` is), but since v14.0 it is a stable and usable backend.
 
 ---
 
@@ -264,7 +283,7 @@ Logs: `audio_hook.log` (main), `audio_hook_detach.log` (detach diagnostics).
 
 - **Any device, no ASIO driver:** `fake_client = 1`, `output = shared`.
 - **ASIO interface:** `fake_client = 1`, `output = asio`, and leave `asio_driver = *` (auto) or pin the name reported by `asio_list`. The interface must run at 44.1 kHz; otherwise the bridge refuses and falls back.
-- **Exclusive experiment:** `output = excl` — run `excl_rate_probe` first; if the device does not report ≈100 %, the mod will fall back anyway.
+- **WASAPI exclusive:** `output = excl` — stable and usable since v14.0; run `excl_rate_probe` first, and the mod still falls back to `shared` if your device's clock cannot keep up.
 - Multi-channel outputs (5.1/7.1) are handled: FL/FR are mapped, remaining channels are silenced.
 
 ---
@@ -371,13 +390,14 @@ worked) · `1` device/COM error · `2` bad command line.
 
 How to read the summary:
 
-- **≥ 95 %** — exclusive is genuinely usable; `output = excl` will keep it.
+- **≥ 99.5 %** — exclusive is genuinely usable; `output = excl` will keep it. (The mod's own gate — see the `excl` section. A lower reading here no longer means the mod will drop it, but push mode is built to sit at 99.9 %.)
 - **90–95 %** — marginal: the queue slowly drains or fills, expect drift/stutter.
 - **< 50 %** — the driver accepted the stream but never starts the hardware clock;
   exclusive cannot be used on that device.
 
-That last case is exactly why the mod runs a **2 s self-test** on `excl` and rolls
-back to `shared` below 90 %. `--shared` runs the same measurement on a normal shared
+That last case is exactly why the mod monitors `excl` on the watchdog thread and rolls
+back to `shared` if the device clock stays below 99.5 % for three consecutive seconds.
+`--shared` runs the same measurement on a normal shared
 stream, which is the quickest way to prove an endpoint is alive at all.
 
 ### `session_tool` — session mute / volume / peak inspector
@@ -429,8 +449,8 @@ cl /nologo /utf-8 /LD /MT /O2 /W3 /I asiosdk /Fe:audio_hook.dll /Fo:obj\ audio_h
 
 ## Known limitations
 
-- **WASAPI exclusive is load-sensitive.** A clean standalone probe can reach ~99.5 % of real time, but inside the game it typically delivers ~94.5 %, and CPU-heavy background apps drag it lower still; some devices (an onboard codec) never move their clock (~0.3 %). The backend self-tests and falls back; it is not the default and not a recommended path.
-- **The exclusive self-test runs on the watchdog thread** (since v13.10), overlapped with playback, so `output = excl` no longer delays the game's audio initialisation — it used to add ~2.2 s (200 ms clock ramp-up skip + 2 s measurement) on the game's init thread. Its window is measured against real elapsed time and the verdict lands within the first few seconds of playback.
+- **WASAPI exclusive is a push-mode writer** (since v14.0): a millisecond writer holding `excl_target_ms` (12 ms by default) of not-yet-heard audio, monitored by the device clock against the wall clock. The old event-callback backend measured 96.5 % even idle, with the device clock itself 3.5 % slow; push mode measures 99.9 % with zero injected silence and is stable enough to use. Some devices (an onboard codec) never move their clock (~0.3 %) and are still rolled back to `shared`. It holds the endpoint exclusively, so movie (stream2) audio is silent, but `asio` remains the default.
+- **The exclusive monitor runs on the watchdog thread**, overlapped with playback, so `output = excl` never delays the game's audio initialisation — it used to add ~2.2 s on the game's init thread. Verdicts land within the first seconds of playback, and it takes three consecutive sub-99.5 % seconds before it falls back.
 - **Movie audio (stream2)** stays on a real WASAPI stream in `asio`/`shared` mode. In `excl` mode the device is taken exclusively, so stream2 fails to initialize (`AUDCLNT_E_DEVICE_IN_USE`) and cutscene audio is silent — this is expected and harmless for gameplay.
 - **Shared mode cannot go below the engine buffer** (~22 ms on most drivers). That is a platform floor, independent of this mod.
 - Only the default render endpoint is used by `shared`/`excl`.
